@@ -1,8 +1,8 @@
 """A process-wide pool of ``opencode serve`` daemons, one per project directory.
 
-A daemon is pinned to the directory it launches in, so a scan's agents — all in the same project
-directory — share one daemon, started on first use with the audit MCP server registered once. Daemons
-live for the process lifetime and are stopped together at shutdown; a scan pod runs one project, so in
+A daemon is pinned to the directory it launches in, so a run's agents — all in the same project
+directory — share one daemon, started on first use with the MCP server registered once. Daemons
+live for the process lifetime and are stopped together at shutdown; a pod runs one project, so in
 practice this holds a single daemon.
 
 The pool exists because the runner is built per agent while the daemon must be shared: keying on the
@@ -14,10 +14,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 
-from sdk_agent.opencode.client import audit_mcp_local_config, register_mcp
-from sdk_agent.opencode.server import OpencodeServer
-
-from core.tools.audit_mcp import AUDIT_SERVER_NAME
+from agent.opencode.client import mcp_local_config, register_mcp
+from agent.opencode.server import OpencodeServer
+from core.tools.mcp import MCP_SERVER_NAME
 from core.utils.logger import logger
 
 _daemons: dict[str, OpencodeServer] = {}
@@ -30,8 +29,8 @@ async def get_opencode_daemon(cwd: str) -> OpencodeServer:
     """Return the serve daemon for a project directory, starting it on first use.
 
     Creation is serialized so concurrent first-use calls share one daemon rather than racing to launch
-    several. A pooled daemon whose process has since died is evicted and relaunched so a mid-scan crash
-    does not poison every later agent. The audit MCP server is always registered at creation; whether
+    several. A pooled daemon whose process has since died is evicted and relaunched so a mid-run crash
+    does not poison every later agent. The MCP server is always registered at creation; whether
     an agent sees its tools is decided per request, so registering unconditionally is safe and keeps
     startup uniform.
     """
@@ -51,8 +50,8 @@ async def get_opencode_daemon(cwd: str) -> OpencodeServer:
             try:
                 await register_mcp(
                     daemon.base_url,
-                    AUDIT_SERVER_NAME,
-                    audit_mcp_local_config(cwd),
+                    MCP_SERVER_NAME,
+                    mcp_local_config(cwd),
                     client=daemon.client,
                 )
             except Exception:

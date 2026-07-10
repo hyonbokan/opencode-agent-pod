@@ -10,9 +10,9 @@ from __future__ import annotations
 import os
 import re
 
-from llm_router import ThinkingEffort
-from llm_router.models import get_provider_for_model, supports_xhigh_effort
-from llm_router.types import Provider
+from llm import ThinkingEffort
+from llm.models import get_provider_for_model, supports_xhigh_effort
+from llm.types import Provider
 
 # Our provider enum -> opencode's provider segment. Key injection is handled separately by
 # build_daemon_env (via _KEY_ALIAS), so only the opencode name is needed here.
@@ -73,7 +73,7 @@ def to_opencode_model(model: str) -> str:
         provider_seg, _, model_id = model.partition("/")
         return f"{provider_seg}/{_strip_openai_snapshot(provider_seg, model_id)}"
     provider = get_provider_for_model(model)
-    name = _OPENCODE_PROVIDER.get(provider)
+    name = _OPENCODE_PROVIDER.get(provider) if provider is not None else None
     if name is None:
         raise ValueError(
             f"Cannot resolve a provider for model {model!r}; pass it as 'provider/model'."

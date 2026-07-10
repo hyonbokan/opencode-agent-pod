@@ -20,7 +20,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from sdk_agent.permissions import PermissionSpec
+from agent.permissions import PermissionSpec
 
 _ALLOW = "allow"
 _DENY = "deny"
@@ -58,7 +58,7 @@ _TOOL_TO_PERMISSION: dict[str, str] = {
 
 # Built-in tools denied when the allow-list omits them, derived from the map above so a new row can't
 # leave a gap. MCP tools aren't here — they have no permission key and are gated by server
-# registration plus the audit-tool denies added to the session ruleset.
+# registration plus the MCP-tool denies added to the session ruleset.
 _GATED_PERMISSIONS: tuple[str, ...] = tuple(dict.fromkeys(_TOOL_TO_PERMISSION.values()))
 
 

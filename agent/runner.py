@@ -4,24 +4,22 @@ import time
 
 from pydantic import BaseModel
 
-from llm_router import ThinkingEffort
-from llm_router.utils.retry import RetryConfig
-
-from sdk_agent.models import DEFAULT_TOOLS, SDKAgentResult
-from sdk_agent.opencode.client import run_session
-from sdk_agent.opencode.daemon_pool import get_opencode_daemon
-from sdk_agent.opencode.driver import DriverResult, TimelineStep
-from sdk_agent.opencode.providers import to_opencode_model, to_opencode_variant
-from sdk_agent.permissions import PermissionSpec
-
+from agent.models import DEFAULT_TOOLS, OpencodeResult
+from agent.opencode.client import run_session
+from agent.opencode.daemon_pool import get_opencode_daemon
+from agent.opencode.driver import DriverResult, TimelineStep
+from agent.opencode.providers import to_opencode_model, to_opencode_variant
+from agent.permissions import PermissionSpec
 from config import config
 from core.integrations.langfuse_opencode import record_opencode_trace
 from core.utils.logger import logger
+from llm import ThinkingEffort
+from llm.utils.retry import RetryConfig
 
 # Background Langfuse trace-ingestion tasks. Each run fires trace recording off its critical path so an
 # agent call never waits on the ingestion roundtrip; the tasks are tracked so flush_pending_traces()
 # can drain them before the process shuts Langfuse down, otherwise a still-in-flight tail trace on the
-# one-shot scan pod would be lost.
+# one-shot pod would be lost.
 _pending_trace_tasks: set[asyncio.Task[None]] = set()
 
 
@@ -41,14 +39,14 @@ async def flush_pending_traces(timeout: float = 30.0) -> None:
 # ---------------------------------------------------------------------------
 # Constructed lazily so the Semaphore binds to the running event loop rather
 # than the import-time loop (which may not exist yet under asyncio.run).
-_GLOBAL_SDK_SEMAPHORE: asyncio.Semaphore | None = None
+_GLOBAL_AGENT_SEMAPHORE: asyncio.Semaphore | None = None
 
 
-def _get_global_sdk_semaphore() -> asyncio.Semaphore:
-    global _GLOBAL_SDK_SEMAPHORE
-    if _GLOBAL_SDK_SEMAPHORE is None:
-        _GLOBAL_SDK_SEMAPHORE = asyncio.Semaphore(config.scan.SDK_GLOBAL_CONCURRENCY)
-    return _GLOBAL_SDK_SEMAPHORE
+def _get_global_agent_semaphore() -> asyncio.Semaphore:
+    global _GLOBAL_AGENT_SEMAPHORE
+    if _GLOBAL_AGENT_SEMAPHORE is None:
+        _GLOBAL_AGENT_SEMAPHORE = asyncio.Semaphore(config.runner.GLOBAL_CONCURRENCY)
+    return _GLOBAL_AGENT_SEMAPHORE
 
 
 # ---------------------------------------------------------------------------
@@ -56,13 +54,13 @@ def _get_global_sdk_semaphore() -> asyncio.Semaphore:
 # ---------------------------------------------------------------------------
 
 
-class SDKAgentRunner:
+class OpencodeRunner:
     """Run one agent query against an ``opencode serve`` daemon, with timeout, budget/turn caps,
     permissions, and concurrency.
 
     Each query runs as one HTTP session on a daemon started per project directory and shared across
-    the scan's agents. Spend and step count are watched on the daemon's event stream, the session is
-    aborted when a cap is crossed, and the result is mapped to an SDKAgentResult.
+    the run's agents. Spend and step count are watched on the daemon's event stream, the session is
+    aborted when a cap is crossed, and the result is mapped to an OpencodeResult.
     """
 
     def __init__(
@@ -96,7 +94,7 @@ class SDKAgentRunner:
         cwd: str,
         max_budget_usd: float | None = None,
         permission: PermissionSpec | None = None,
-    ) -> SDKAgentResult:
+    ) -> OpencodeResult:
         """Run one query on a shared serve daemon under the concurrency limiter, then validate any
         structured output against the response model."""
         spec = permission or PermissionSpec()
@@ -104,7 +102,7 @@ class SDKAgentRunner:
         opencode_model = to_opencode_model(self._model)
         variant = to_opencode_variant(self._thinking_effort, opencode_model)
 
-        async with _get_global_sdk_semaphore(), self._semaphore:
+        async with _get_global_agent_semaphore(), self._semaphore:
             logger.debug(
                 "opencode agent start cwd=%s model=%s timeout=%.0fs retries=%d",
                 cwd,
@@ -158,10 +156,10 @@ class SDKAgentRunner:
         opencode_model: str,
         variant: str | None,
         budget: float | None,
-    ) -> tuple[SDKAgentResult, list[TimelineStep] | None]:
+    ) -> tuple[OpencodeResult, list[TimelineStep] | None]:
         """Run one query on a serve daemon and return the result plus its event timeline.
 
-        A daemon for the project directory comes from the pool (started and audit-MCP-registered on
+        A daemon for the project directory comes from the pool (started and MCP-registered on
         first use, then shared) and one HTTP session sends the prompt. Timeout, budget, and turn cap
         are enforced inside the session as terminal results; the retry here only covers a failure to
         acquire or reach the daemon. A run that still cannot start returns an error result.
@@ -204,15 +202,15 @@ class SDKAgentRunner:
         logger.error(
             "All %d attempts exhausted. Last error: %s", retry_cfg.max_retries + 1, last_error
         )
-        return SDKAgentResult(
+        return OpencodeResult(
             text=str(last_error) or "opencode serve execution failed",
             is_error=True,
             duration_ms=elapsed,
         ), None
 
     @staticmethod
-    def _to_result(driver_result: DriverResult) -> SDKAgentResult:
-        """Map the driver's raw result onto the public SDKAgentResult, classifying the run as
+    def _to_result(driver_result: DriverResult) -> OpencodeResult:
+        """Map the driver's raw result onto the public OpencodeResult, classifying the run as
         success, timeout, over-budget, or error."""
         parsed = driver_result.parsed
         is_error = (
@@ -236,7 +234,7 @@ class SDKAgentRunner:
             subtype = "success"
 
         text = parsed.text or (parsed.error or subtype if is_error else parsed.text)
-        return SDKAgentResult(
+        return OpencodeResult(
             text=text,
             is_error=is_error,
             total_cost_usd=parsed.cost_usd or None,

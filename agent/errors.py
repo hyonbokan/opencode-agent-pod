@@ -1,4 +1,4 @@
-"""Error classes for the SDK agent runner."""
+"""Error classes for the agent runner."""
 
 from __future__ import annotations
 

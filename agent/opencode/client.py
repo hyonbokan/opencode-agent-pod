@@ -20,14 +20,13 @@ from typing import Any
 import httpx
 from pydantic import BaseModel
 
-from sdk_agent.errors import SessionStartError
-from sdk_agent.opencode.driver import DriverResult, ParsedRun, build_timeline
-from sdk_agent.opencode.permission_config import permission_config
-from sdk_agent.opencode.providers import provider_of
-from sdk_agent.opencode.server import OpencodeServer
-from sdk_agent.permissions import PermissionSpec
-
-from core.tools.audit_mcp import AUDIT_SERVER_NAME, SERVER_SCRIPT, get_allowed_tool_names
+from agent.errors import SessionStartError
+from agent.opencode.driver import DriverResult, ParsedRun, build_timeline
+from agent.opencode.permission_config import permission_config
+from agent.opencode.providers import provider_of
+from agent.opencode.server import OpencodeServer
+from agent.permissions import PermissionSpec
+from core.tools.mcp import MCP_SERVER_NAME, SERVER_SCRIPT, get_allowed_tool_names
 
 # Retries opencode makes internally to coax a schema-valid structured output before giving up.
 _STRUCTURED_RETRY_COUNT = 2
@@ -35,20 +34,20 @@ _STRUCTURED_RETRY_COUNT = 2
 # Short wait for the trailing step-finish plus idle marker to arrive after the prompt POST returns.
 _IDLE_DRAIN_TIMEOUT = 3.0
 
-# Audit MCP tool IDs in opencode's "<server>_<tool>" form; an agent's allow-list names them when it
+# MCP tool IDs in opencode's "<server>_<tool>" form; an agent's allow-list names them when it
 # wants the analysis tools.
-_AUDIT_TOOL_IDS: tuple[str, ...] = tuple(
-    t for t in get_allowed_tool_names() if t.startswith(f"{AUDIT_SERVER_NAME}_")
+_MCP_TOOL_IDS: tuple[str, ...] = tuple(
+    t for t in get_allowed_tool_names() if t.startswith(f"{MCP_SERVER_NAME}_")
 )
 
 
-def audit_mcp_local_config(cwd: str) -> dict[str, Any]:
-    """Build the ``POST /mcp`` config that registers the audit tool server on the daemon.
+def mcp_local_config(cwd: str) -> dict[str, Any]:
+    """Build the ``POST /mcp`` config that registers the MCP tool server on the daemon.
 
     The server exposes only the analysis tools; structured output comes from the request format
     instead. Its project directory is passed explicitly because it runs as a separate process.
     """
-    command = [sys.executable, SERVER_SCRIPT, "--project-dir", cwd, "--with-audit-tools"]
+    command = [sys.executable, SERVER_SCRIPT, "--project-dir", cwd, "--with-tools"]
     return {"type": "local", "command": command, "enabled": True}
 
 
@@ -82,7 +81,7 @@ def to_permission_ruleset(spec: PermissionSpec, tools: list[str], cwd: str) -> l
     """Flatten the shared permission config into serve's per-session ruleset — a flat list of
     permission/pattern/action, insertion-ordered so the last matching rule wins.
 
-    Audit tools are gated here too: each one the allow-list omits gets a ``*``-pattern deny, which
+    MCP tools are gated here too: each one the allow-list omits gets a ``*``-pattern deny, which
     opencode treats as disabling it. This must live in the session ruleset, not the per-message tools
     map — opencode turns that map into permissions and replaces the whole ruleset with it.
     """
@@ -94,7 +93,7 @@ def to_permission_ruleset(spec: PermissionSpec, tools: list[str], cwd: str) -> l
             for pattern, action in value.items():
                 rules.append({"permission": key, "pattern": pattern, "action": action})
     allowed = set(tools)
-    for tool_id in _AUDIT_TOOL_IDS:
+    for tool_id in _MCP_TOOL_IDS:
         if tool_id not in allowed:
             rules.append({"permission": tool_id, "pattern": "*", "action": "deny"})
     return rules
@@ -184,7 +183,7 @@ class _SessionWatcher:
         if etype != _PART_EVENT:
             return False
         part = (event.get("properties") or {}).get("part") or {}
-        run_type = _PART_TYPE_MAP.get(part.get("type"))
+        run_type = _PART_TYPE_MAP.get(part.get("type", ""))
         if run_type is not None:
             part_id = part.get("id")
             if not isinstance(part_id, str):
@@ -306,7 +305,7 @@ async def run_session(
         try:
             session = await client.post(f"{base_url}/session", json={"permission": ruleset})
             session.raise_for_status()
-            session_id = session.json()["id"]
+            session_id = str(session.json()["id"])
         except (httpx.HTTPError, RuntimeError) as e:
             # Pre-prompt and idempotent (RuntimeError covers the shared client being closed by a
             # concurrent daemon eviction): raise so the runner retries against a fresh daemon.
@@ -369,7 +368,7 @@ async def run_session(
             message_json, watcher, duration_ms=_elapsed_ms(t0), fallback_cost=fallback_cost
         )
     finally:
-        # Deregister the watcher and delete the session so a long scan's shared daemon doesn't
+        # Deregister the watcher and delete the session so a long run's shared daemon doesn't
         # accumulate either. Best-effort: a failure here must never mask the run's result.
         if session_id is not None:
             server.remove_watcher(session_id)

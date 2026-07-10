@@ -18,8 +18,8 @@ DEFAULT_TOOLS: list[str] = [
 # ---------------------------------------------------------------------------
 
 
-class SDKAgentResult(BaseModel):
-    """Result from an SDK agent execution."""
+class OpencodeResult(BaseModel):
+    """Result from an agent execution."""
 
     text: str
     is_error: bool = False

@@ -1,7 +1,7 @@
 """Manage the lifecycle of one ``opencode serve`` daemon.
 
-A daemon is pinned to the directory it launches in, so one is started per scan against the cloned
-project and multiplexes the scan's agents as HTTP sessions. This module owns only the process: launch
+A daemon is pinned to the directory it launches in, so one is started per project directory against the cloned
+project and multiplexes the run's agents as HTTP sessions. This module owns only the process: launch
 it on a free port, wait until it answers a health check, and reap the whole tree on shutdown. Nothing
 is enforced here — permissions, tools, and structured output are set per session and per request.
 """
@@ -17,10 +17,9 @@ from uuid import uuid4
 
 import httpx
 
-from sdk_agent.opencode.driver import _drain_output, terminate_tree
-from sdk_agent.opencode.events import EventConsumer, Watcher
-from sdk_agent.opencode.providers import build_daemon_env
-
+from agent.opencode.driver import _drain_output, terminate_tree
+from agent.opencode.events import EventConsumer, Watcher
+from agent.opencode.providers import build_daemon_env
 from config import config
 from core.utils.logger import logger
 
@@ -31,7 +30,7 @@ _OUTPUT_TAIL_CHUNKS = 16
 _CLIENT_TIMEOUT = 30.0
 # Env var tagged onto the daemon (and inherited by every tool process it spawns) so a crashed
 # daemon's detached, reparented children can still be found and reaped on teardown.
-_REAP_ENV_MARKER = "AUDITAGENT_OPENCODE_REAP_TAG"
+_REAP_ENV_MARKER = "OPENCODE_POD_REAP_TAG"
 
 
 def _free_port(host: str) -> int:
@@ -46,7 +45,7 @@ def _free_port(host: str) -> int:
 
 
 class OpencodeServer:
-    """A running ``opencode serve`` daemon for one scan's working directory.
+    """A running ``opencode serve`` daemon for one run's working directory.
 
     Use it as an async context manager, or call start/stop directly. Every provider's key is placed in
     the environment at launch so any model can be addressed, and any opencode config in the scanned
@@ -68,9 +67,7 @@ class OpencodeServer:
         self._reap_tag = uuid4().hex
         self._env[_REAP_ENV_MARKER] = self._reap_tag
         self._startup_timeout = (
-            startup_timeout
-            if startup_timeout is not None
-            else config.scan.SDK_SERVE_STARTUP_TIMEOUT
+            startup_timeout if startup_timeout is not None else config.runner.SERVE_STARTUP_TIMEOUT
         )
         self._proc: asyncio.subprocess.Process | None = None
         self._port: int | None = None
@@ -87,7 +84,7 @@ class OpencodeServer:
 
     @property
     def client(self) -> httpx.AsyncClient:
-        """One HTTP client shared across the scan's sessions, so calls reuse keep-alive connections."""
+        """One HTTP client shared across the run's sessions, so calls reuse keep-alive connections."""
         if self._client is None:
             raise RuntimeError("OpencodeServer is not started")
         return self._client
