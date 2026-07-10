@@ -16,7 +16,7 @@ import contextlib
 
 from agent.opencode.client import mcp_local_config, register_mcp
 from agent.opencode.server import OpencodeServer
-from core.tools.mcp import MCP_SERVER_NAME
+from core.tools.mcp import MCP_SERVER_NAME, is_mcp_configured
 from core.utils.logger import logger
 
 _daemons: dict[str, OpencodeServer] = {}
@@ -30,9 +30,10 @@ async def get_opencode_daemon(cwd: str) -> OpencodeServer:
 
     Creation is serialized so concurrent first-use calls share one daemon rather than racing to launch
     several. A pooled daemon whose process has since died is evicted and relaunched so a mid-run crash
-    does not poison every later agent. The MCP server is always registered at creation; whether
-    an agent sees its tools is decided per request, so registering unconditionally is safe and keeps
-    startup uniform.
+    does not poison every later agent. An MCP server is registered at creation only when one is
+    configured; whether an agent sees its tools is decided per request, so registering whenever a
+    server exists is safe and keeps startup uniform. With none configured (the placeholder registry),
+    registration is skipped rather than failing to connect a server that does not exist.
     """
     async with _lock:
         daemon = _daemons.get(cwd)
@@ -45,19 +46,20 @@ async def get_opencode_daemon(cwd: str) -> OpencodeServer:
         if daemon is None:
             daemon = OpencodeServer(cwd)
             await daemon.start()
-            # The daemon is running but not yet pooled, so a registration failure would leave an
-            # untracked process shutdown can't reap; stop it before re-raising.
-            try:
-                await register_mcp(
-                    daemon.base_url,
-                    MCP_SERVER_NAME,
-                    mcp_local_config(cwd),
-                    client=daemon.client,
-                )
-            except Exception:
-                with contextlib.suppress(Exception):
-                    await daemon.stop()
-                raise
+            if is_mcp_configured():
+                # The daemon is running but not yet pooled, so a registration failure would leave an
+                # untracked process shutdown can't reap; stop it before re-raising.
+                try:
+                    await register_mcp(
+                        daemon.base_url,
+                        MCP_SERVER_NAME,
+                        mcp_local_config(cwd),
+                        client=daemon.client,
+                    )
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        await daemon.stop()
+                    raise
             _daemons[cwd] = daemon
             logger.info("opencode serve daemon ready for %s at %s", cwd, daemon.base_url)
         return daemon

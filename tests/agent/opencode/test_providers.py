@@ -3,10 +3,15 @@ No opencode invocation, no network — pure mapping."""
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from agent.opencode.providers import (
+    CustomProvider,
     build_daemon_env,
+    build_provider_config,
+    load_custom_providers,
     provider_of,
     to_opencode_model,
     to_opencode_variant,
@@ -87,7 +92,82 @@ def test_build_daemon_env_prefers_direct_key_and_invents_nothing():
         # No effort requested -> no variant, on any provider.
         (None, "openai/gpt-5-nano", None),
         (None, "anthropic/claude-haiku-4-5", None),
+        # Custom (non-catalog) providers get no variant regardless of effort — we don't know their
+        # effort support, and a strict OpenAI-compatible endpoint may reject an unexpected param.
+        (ThinkingEffort.MEDIUM, "vllm/llama-bgp", None),
+        (ThinkingEffort.MAX, "vllm/llama-bgp", None),
     ],
 )
 def test_to_opencode_variant(effort, model, expected):
     assert to_opencode_variant(effort, model) == expected
+
+
+def test_load_custom_providers_parses_env_json_and_defaults_empty():
+    assert load_custom_providers({}) == []
+    assert load_custom_providers({"AGENT_CUSTOM_PROVIDERS": "  "}) == []
+    providers = load_custom_providers(
+        {
+            "AGENT_CUSTOM_PROVIDERS": json.dumps(
+                [{"name": "vllm", "base_url": "http://h:8000/v1", "models": ["llama-bgp"]}]
+            )
+        }
+    )
+    assert len(providers) == 1
+    assert providers[0].name == "vllm"
+    assert providers[0].npm == "@ai-sdk/openai-compatible"  # default
+
+
+def test_build_provider_config_shapes_opencode_config_and_resolves_key_from_env():
+    providers = [
+        CustomProvider(
+            name="vllm",
+            base_url="http://h:8000/v1",
+            models=["llama-bgp", "gemma"],
+            api_key_env="VLLM_KEY",
+        )
+    ]
+    config = build_provider_config(providers, {"VLLM_KEY": "secret"})
+    assert config is not None
+    entry = config["provider"]["vllm"]
+    assert entry["npm"] == "@ai-sdk/openai-compatible"
+    assert entry["options"] == {"baseURL": "http://h:8000/v1", "apiKey": "secret"}
+    assert set(entry["models"]) == {"llama-bgp", "gemma"}
+
+
+def test_build_provider_config_omits_apikey_when_none_and_returns_none_when_empty():
+    assert build_provider_config([], {}) is None
+    # No env var value and no literal -> no apiKey emitted (a keyless local endpoint is valid).
+    config = build_provider_config(
+        [CustomProvider(name="vllm", base_url="http://h/v1", models=["m"], api_key_env="MISSING")],
+        {},
+    )
+    assert config is not None
+    assert "apiKey" not in config["provider"]["vllm"]["options"]
+
+
+def test_build_daemon_env_injects_custom_provider_config():
+    env = build_daemon_env(
+        {
+            "AGENT_CUSTOM_PROVIDERS": json.dumps(
+                [{"name": "vllm", "base_url": "http://h:8000/v1", "models": ["llama-bgp"]}]
+            )
+        }
+    )
+    config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+    assert config["provider"]["vllm"]["options"]["baseURL"] == "http://h:8000/v1"
+    assert "llama-bgp" in config["provider"]["vllm"]["models"]
+
+
+def test_build_daemon_env_leaves_config_content_alone_when_no_custom_providers_or_when_explicit():
+    # No custom providers declared -> the daemon config content is not conjured into existence.
+    assert "OPENCODE_CONFIG_CONTENT" not in build_daemon_env({"OPENAI_API_KEY": "ok"})
+    # An explicit config content is authoritative and never overwritten by the compiled one.
+    env = build_daemon_env(
+        {
+            "OPENCODE_CONFIG_CONTENT": '{"explicit": true}',
+            "AGENT_CUSTOM_PROVIDERS": json.dumps(
+                [{"name": "vllm", "base_url": "http://h/v1", "models": ["m"]}]
+            ),
+        }
+    )
+    assert env["OPENCODE_CONFIG_CONTENT"] == '{"explicit": true}'

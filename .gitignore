@@ -47,6 +47,7 @@ internal/
 docs/internal/
 scratch/
 *.local.md
+scripts/
 
 # --- OS / editor cruft ---
 .DS_Store

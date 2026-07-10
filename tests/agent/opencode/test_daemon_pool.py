@@ -34,6 +34,8 @@ class _FakeServer:
 def clean_pool(monkeypatch):
     monkeypatch.setattr(pool, "OpencodeServer", _FakeServer)
     monkeypatch.setattr(pool, "register_mcp", AsyncMock(return_value={}))
+    # A server is configured, so the daemon registers it — the path these tests exercise.
+    monkeypatch.setattr(pool, "is_mcp_configured", lambda: True)
     pool._daemons.clear()
     yield
     pool._daemons.clear()
@@ -88,6 +90,7 @@ async def test_register_failure_stops_daemon_and_leaves_pool_empty(monkeypatch):
 
     monkeypatch.setattr(pool, "OpencodeServer", _RecordingServer)
     monkeypatch.setattr(pool, "register_mcp", AsyncMock(side_effect=RuntimeError("mcp down")))
+    monkeypatch.setattr(pool, "is_mcp_configured", lambda: True)
     pool._daemons.clear()
 
     with pytest.raises(RuntimeError, match="mcp down"):
@@ -96,6 +99,24 @@ async def test_register_failure_stops_daemon_and_leaves_pool_empty(monkeypatch):
     assert len(started) == 1
     assert started[0].stopped == 1  # the orphan was reaped
     assert pool._daemons == {}  # nothing cached, so a retry starts clean
+    pool._daemons.clear()
+
+
+@pytest.mark.asyncio
+async def test_get_daemon_skips_mcp_registration_when_unconfigured(monkeypatch):
+    # With no MCP server configured (the placeholder registry), the daemon must start and be pooled
+    # without attempting registration — registering a server that does not exist would fail to
+    # connect and wrongly kill an otherwise healthy daemon.
+    monkeypatch.setattr(pool, "OpencodeServer", _FakeServer)
+    monkeypatch.setattr(pool, "register_mcp", AsyncMock(return_value={}))
+    monkeypatch.setattr(pool, "is_mcp_configured", lambda: False)
+    pool._daemons.clear()
+
+    daemon: Any = await pool.get_opencode_daemon("/a")
+
+    assert daemon.started == 1
+    assert cast(AsyncMock, pool.register_mcp).await_count == 0  # registration was skipped
+    assert pool._daemons["/a"] is daemon  # still pooled and usable
     pool._daemons.clear()
 
 
