@@ -1,0 +1,4 @@
+# Runtime dependencies of the copied engine (sdk_agent/).
+# The HTTP + SSE service layer (FastAPI/uvicorn) is added at Phase 2 — see PLAN.md.
+httpx>=0.27
+pydantic>=2.7

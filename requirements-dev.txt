@@ -1,0 +1,8 @@
+-r requirements.txt
+
+# Match the versions pinned in .pre-commit-config.yaml so local runs and hooks agree.
+pre-commit
+ruff==0.15.20
+mypy==1.13.0
+pytest
+pytest-asyncio

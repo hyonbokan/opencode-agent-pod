@@ -1,0 +1,41 @@
+# Run locally with:
+#   pip install pre-commit && pre-commit install
+#   pre-commit run --all-files
+#
+# Python lives at the repo root (sdk_agent/, and the pod service added later),
+# configured by ./pyproject.toml — one source of truth shared with local runs.
+
+exclude: '^(.*/__pycache__/|.*\.egg-info/)'
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+        args: [--maxkb=2048]
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.20
+    hooks:
+      # Lint + autofix (unused imports/vars via Pyflakes, import sorting via isort).
+      - id: ruff
+        args: [--config=pyproject.toml, --fix]
+      # Formatter (Black-compatible).
+      - id: ruff-format
+        args: [--config=pyproject.toml]
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.13.0
+    hooks:
+      - id: mypy
+        args: [--config-file=pyproject.toml]
+        additional_dependencies:
+          - pydantic==2.9.2
