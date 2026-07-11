@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import sys
 import time
 from typing import Any
 
@@ -26,7 +25,7 @@ from agent.opencode.permission_config import permission_config
 from agent.opencode.providers import provider_of
 from agent.opencode.server import OpencodeServer
 from agent.permissions import PermissionSpec
-from core.tools.mcp import MCP_SERVER_NAME, SERVER_SCRIPT, get_allowed_tool_names
+from core.tools.mcp import McpServer, mcp_tool_ids
 
 # Retries opencode makes internally to coax a schema-valid structured output before giving up.
 _STRUCTURED_RETRY_COUNT = 2
@@ -34,21 +33,14 @@ _STRUCTURED_RETRY_COUNT = 2
 # Short wait for the trailing step-finish plus idle marker to arrive after the prompt POST returns.
 _IDLE_DRAIN_TIMEOUT = 3.0
 
-# MCP tool IDs in opencode's "<server>_<tool>" form; an agent's allow-list names them when it
-# wants the analysis tools.
-_MCP_TOOL_IDS: tuple[str, ...] = tuple(
-    t for t in get_allowed_tool_names() if t.startswith(f"{MCP_SERVER_NAME}_")
-)
 
+def mcp_local_config(server: McpServer) -> dict[str, Any]:
+    """Build the ``POST /mcp`` config that registers one local MCP server on the daemon.
 
-def mcp_local_config(cwd: str) -> dict[str, Any]:
-    """Build the ``POST /mcp`` config that registers the MCP tool server on the daemon.
-
-    The server exposes only the analysis tools; structured output comes from the request format
-    instead. Its project directory is passed explicitly because it runs as a separate process.
+    The command comes straight from deployment config; the pod injects nothing, so a server that
+    needs the workspace directory must carry it in its own declared argv.
     """
-    command = [sys.executable, SERVER_SCRIPT, "--project-dir", cwd, "--with-tools"]
-    return {"type": "local", "command": command, "enabled": True}
+    return {"type": "local", "command": list(server.command), "enabled": True}
 
 
 async def register_mcp(
@@ -93,7 +85,7 @@ def to_permission_ruleset(spec: PermissionSpec, tools: list[str], cwd: str) -> l
             for pattern, action in value.items():
                 rules.append({"permission": key, "pattern": pattern, "action": action})
     allowed = set(tools)
-    for tool_id in _MCP_TOOL_IDS:
+    for tool_id in mcp_tool_ids():
         if tool_id not in allowed:
             rules.append({"permission": tool_id, "pattern": "*", "action": "deny"})
     return rules

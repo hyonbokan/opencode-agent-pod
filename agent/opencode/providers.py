@@ -15,7 +15,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from llm import ThinkingEffort
+from llm import ReasoningEffort
 from llm.models import get_provider_for_model, supports_xhigh_effort
 from llm.types import Provider
 
@@ -101,7 +101,7 @@ def _strip_openai_snapshot(provider: str, model_id: str) -> str:
     return _OPENAI_SNAPSHOT_DATE.sub("", model_id) if provider == "openai" else model_id
 
 
-def to_opencode_variant(effort: ThinkingEffort | None, opencode_model: str) -> str | None:
+def to_opencode_variant(effort: ReasoningEffort | None, opencode_model: str) -> str | None:
     """Return the opencode ``--variant`` for a reasoning effort on a model, or None for the default.
 
     opencode selects reasoning effort through a per-model variant. Anthropic exposes only ``high``
@@ -118,8 +118,8 @@ def to_opencode_variant(effort: ThinkingEffort | None, opencode_model: str) -> s
         return None
     if provider_of(opencode_model) == "anthropic":
         # opencode has no low/medium variants for Anthropic models
-        return {ThinkingEffort.HIGH: "high", ThinkingEffort.MAX: "max"}.get(effort)
-    if effort is ThinkingEffort.MAX:
+        return {ReasoningEffort.HIGH: "high", ReasoningEffort.MAX: "max"}.get(effort)
+    if effort is ReasoningEffort.MAX:
         model_id = opencode_model.split("/", 1)[-1]
         if provider_of(opencode_model) == "openai" and supports_xhigh_effort(model_id):
             return "xhigh"

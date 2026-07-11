@@ -13,7 +13,7 @@ from agent.permissions import PermissionSpec
 from config import config
 from core.integrations.langfuse_opencode import record_opencode_trace
 from core.utils.logger import logger
-from llm import ThinkingEffort
+from llm import ReasoningEffort
 from llm.utils.retry import RetryConfig
 
 # Background Langfuse trace-ingestion tasks. Each run fires trace recording off its critical path so an
@@ -74,13 +74,13 @@ class OpencodeRunner:
         max_retries: int = 1,
         concurrency: int = 7,
         max_budget_usd: float | None = None,
-        thinking_effort: ThinkingEffort | None = ThinkingEffort.MEDIUM,
+        reasoning_effort: ReasoningEffort | None = ReasoningEffort.MEDIUM,
     ) -> None:
         self._model = model
         self._tools = list(tools) if tools is not None else list(DEFAULT_TOOLS)
         self._response_model = response_model
         self._max_turns = max_turns
-        self._thinking_effort = thinking_effort
+        self._reasoning_effort = reasoning_effort
         self._session_timeout = session_timeout
         self._max_retries = max_retries
         self._max_budget_usd = max_budget_usd
@@ -100,7 +100,7 @@ class OpencodeRunner:
         spec = permission or PermissionSpec()
         budget = max_budget_usd if max_budget_usd is not None else self._max_budget_usd
         opencode_model = to_opencode_model(self._model)
-        variant = to_opencode_variant(self._thinking_effort, opencode_model)
+        variant = to_opencode_variant(self._reasoning_effort, opencode_model)
 
         async with _get_global_agent_semaphore(), self._semaphore:
             logger.debug(

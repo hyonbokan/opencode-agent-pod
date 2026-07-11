@@ -61,23 +61,29 @@ def test_bash_catch_all_allow_precedes_denies(git_root):
         assert keys.index("*") < keys.index(glob)
 
 
-def test_compilation_spec_blocks_sol_sources_but_allows_tests(git_root):
-    edit = permission_config(PermissionSpec(block_sol_sources=True), _ALL, git_root)["edit"]
-    # A single "*" traverses "/" in opencode's matcher, so the bare globs fence .sol at any depth.
-    assert _edit_action(edit, "Counter.sol") == "deny"
-    assert _edit_action(edit, "src/deep/Counter.sol") == "deny"
-    assert _edit_action(edit, "test/Counter.t.sol") == "allow"
-    assert _edit_action(edit, "script/Deploy.s.sol") == "allow"
-    assert _edit_action(edit, "README.md") == "allow"  # only .sol sources are fenced
+def test_write_deny_blocks_globs_over_the_allow_floor(git_root):
+    # With no write_allow the edit floor is allow; write_deny fences specific globs off it. A single
+    # "*" traverses "/" in opencode's matcher, so a bare glob fences a name at any depth.
+    edit = permission_config(PermissionSpec(write_deny=("*.env", "secrets/**")), _ALL, git_root)[
+        "edit"
+    ]
+    assert _edit_action(edit, "config.env") == "deny"
+    assert _edit_action(edit, "deep/config.env") == "deny"
+    assert _edit_action(edit, "secrets/key.pem") == "deny"
+    assert _edit_action(edit, "src/main.py") == "allow"  # the allow floor holds elsewhere
 
 
-def test_deny_rules_precede_allow_rules(git_root):
-    """opencode keeps the last matching rule, so the broad .sol deny must come before the specific
-    .t.sol/.s.sol allows that override it — otherwise a test file would be blocked."""
-    edit = permission_config(PermissionSpec(block_sol_sources=True), _ALL, git_root)["edit"]
+def test_write_deny_overrides_write_allow(git_root):
+    # write_deny is emitted last, so it carves holes out of an exclusive write_allow set.
+    edit = permission_config(
+        PermissionSpec(write_allow=("src/**",), write_deny=("src/secret.txt",)), _ALL, git_root
+    )["edit"]
+    assert _edit_action(edit, "src/main.py") == "allow"
+    assert _edit_action(edit, "src/secret.txt") == "deny"
+    assert _edit_action(edit, "README.md") == "deny"  # outside the write_allow set
+    # last-match-wins ordering: blanket deny, then the allow, then the specific deny that overrides it
     keys = list(edit)
-    assert keys.index("*.sol") < keys.index("*.t.sol")
-    assert keys.index("*.sol") < keys.index("*.s.sol")
+    assert keys.index("**") < keys.index("src/**") < keys.index("src/secret.txt")
 
 
 def test_fork_bomb_is_denied(git_root):
@@ -159,9 +165,7 @@ def test_edit_denied_outright_when_not_allowed_even_with_write_spec(git_root):
 def test_lowercase_and_mcp_tool_names_are_handled(git_root):
     # opencode-lowercase names gate the same as PascalCase; write maps to the edit key; unknown MCP
     # tool names contribute no permission key and so are neither allowed-mapped nor denied.
-    cfg = permission_config(
-        PermissionSpec(), ["read", "write", "bash", "opencode-agent_forge-test"], git_root
-    )
+    cfg = permission_config(PermissionSpec(), ["read", "write", "bash", "demo_lookup"], git_root)
     assert cfg["bash"]["*"] == "allow"
     assert "edit" not in cfg  # write mapped to edit → allowed, no path rules
     assert "read" not in cfg

@@ -16,7 +16,7 @@ import contextlib
 
 from agent.opencode.client import mcp_local_config, register_mcp
 from agent.opencode.server import OpencodeServer
-from core.tools.mcp import MCP_SERVER_NAME, is_mcp_configured
+from core.tools.mcp import registered_servers
 from core.utils.logger import logger
 
 _daemons: dict[str, OpencodeServer] = {}
@@ -30,10 +30,9 @@ async def get_opencode_daemon(cwd: str) -> OpencodeServer:
 
     Creation is serialized so concurrent first-use calls share one daemon rather than racing to launch
     several. A pooled daemon whose process has since died is evicted and relaunched so a mid-run crash
-    does not poison every later agent. An MCP server is registered at creation only when one is
-    configured; whether an agent sees its tools is decided per request, so registering whenever a
-    server exists is safe and keeps startup uniform. With none configured (the placeholder registry),
-    registration is skipped rather than failing to connect a server that does not exist.
+    does not poison every later agent. Every deployment-configured MCP server is registered at
+    creation; whether an agent sees a server's tools is decided per request, so registering them all
+    is safe and keeps startup uniform. With none configured the registration loop is a no-op.
     """
     async with _lock:
         daemon = _daemons.get(cwd)
@@ -46,23 +45,39 @@ async def get_opencode_daemon(cwd: str) -> OpencodeServer:
         if daemon is None:
             daemon = OpencodeServer(cwd)
             await daemon.start()
-            if is_mcp_configured():
-                # The daemon is running but not yet pooled, so a registration failure would leave an
-                # untracked process shutdown can't reap; stop it before re-raising.
-                try:
+            # The daemon is running but not yet pooled, so a registration failure would leave an
+            # untracked process shutdown can't reap; stop it before re-raising. No servers → no-op.
+            try:
+                for server in registered_servers():
                     await register_mcp(
                         daemon.base_url,
-                        MCP_SERVER_NAME,
-                        mcp_local_config(cwd),
+                        server.name,
+                        mcp_local_config(server),
                         client=daemon.client,
                     )
-                except Exception:
-                    with contextlib.suppress(Exception):
-                        await daemon.stop()
-                    raise
+            except Exception:
+                with contextlib.suppress(Exception):
+                    await daemon.stop()
+                raise
             _daemons[cwd] = daemon
             logger.info("opencode serve daemon ready for %s at %s", cwd, daemon.base_url)
         return daemon
+
+
+async def stop_opencode_daemon(cwd: str) -> None:
+    """Stop and evict the daemon for one working directory, if pooled. Safe when none is pooled.
+
+    The pool otherwise holds a daemon for the process lifetime, which fits a single long-lived
+    project directory. A caller that gives each run its own ephemeral directory (the pod service)
+    uses this to reap that run's daemon before its directory is torn down, so daemons don't
+    accumulate one per request. The daemon is popped under the lock but stopped outside it, so
+    process teardown doesn't serialize new daemon starts.
+    """
+    async with _lock:
+        daemon = _daemons.pop(cwd, None)
+    if daemon is not None:
+        with contextlib.suppress(Exception):
+            await daemon.stop()
 
 
 async def shutdown_opencode_daemons() -> None:

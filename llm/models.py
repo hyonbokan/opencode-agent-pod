@@ -178,8 +178,8 @@ def supports_xhigh_effort(model: str) -> bool:
 def get_thinking_budget_for_model(model: str) -> int:
     """Get the thinking budget for models that support it.
 
-    Only called for Gemini 2.5 models when thinking_effort != LOW.
-    ThinkingEffort.LOW is handled by the provider (no thinking_config set for 2.5,
+    Only called for Gemini 2.5 models when reasoning_effort != LOW.
+    ReasoningEffort.LOW is handled by the provider (no thinking_config set for 2.5,
     budget=0 for Flash which supports disabling thinking).
     """
     if model.startswith("gemini-2"):

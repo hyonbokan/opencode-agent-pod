@@ -67,8 +67,8 @@ class VerboseLevel(StrEnum):
     HIGH = "high"
 
 
-class ThinkingEffort(StrEnum):
-    """Thinking effort levels for models that support configurable thinking.
+class ReasoningEffort(StrEnum):
+    """Reasoning effort levels for models that support configurable reasoning.
 
     Maps to OpenAI/Grok ``reasoning.effort`` and Anthropic ``output_config.effort``.
     MAX maps to ``xhigh`` for OpenAI and ``max`` for Anthropic.

@@ -141,19 +141,19 @@ async def test_turn_cap_is_not_an_error(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_thinking_effort_maps_to_variant(tmp_path):
-    from llm import ThinkingEffort
+async def test_reasoning_effort_maps_to_variant(tmp_path):
+    from llm import ReasoningEffort
 
     capture: dict = {}
     with _patch_serve(capture=capture):
         await OpencodeRunner(
-            model="claude-sonnet-4-6", thinking_effort=ThinkingEffort.HIGH, max_retries=0
+            model="claude-sonnet-4-6", reasoning_effort=ReasoningEffort.HIGH, max_retries=0
         ).run(user_message="x", cwd=str(tmp_path))
     assert capture["variant"] == "high"
 
 
 @pytest.mark.asyncio
-async def test_no_variant_without_thinking_effort(tmp_path):
+async def test_no_variant_without_reasoning_effort(tmp_path):
     # Default: no reasoning variant is passed, so the model runs at its default (behavior-neutral).
     capture: dict = {}
     with _patch_serve(capture=capture):

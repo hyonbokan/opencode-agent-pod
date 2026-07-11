@@ -67,6 +67,12 @@ def _allowed_permission_keys(tools: list[str]) -> set[str]:
     return {key for t in tools if (key := _TOOL_TO_PERMISSION.get(t.strip().lower()))}
 
 
+def _anchor(prefix: str, pattern: str) -> str:
+    """Anchor a caller's project-relative glob to opencode's worktree prefix."""
+    pattern = pattern.lstrip("/")
+    return f"{prefix}/{pattern}" if prefix else pattern
+
+
 def _worktree_prefix(cwd: str) -> str:
     """The prefix opencode puts before an edit pattern for a file in the run's working directory.
 
@@ -106,18 +112,17 @@ def permission_config(spec: PermissionSpec, tools: list[str], cwd: str) -> dict[
         # pointing outside can still be written; these globs confine ordinary paths, and symlink
         # containment relies on pod isolation.
         edit: dict[str, str] = {}
-        if spec.write_allow:
-            edit["**"] = _DENY
+        if spec.write_allow or spec.write_deny:
             prefix = _worktree_prefix(cwd)
-            for pattern in spec.write_allow:
-                pattern = pattern.lstrip("/")
-                edit[f"{prefix}/{pattern}" if prefix else pattern] = _ALLOW
-        if spec.block_sol_sources:
-            # A single "*" traverses "/" in opencode's matcher, so the bare globs cover .sol files
-            # at any depth. Denies precede the test/script allows that carve them back out.
-            edit["*.sol"] = _DENY
-            edit["*.t.sol"] = _ALLOW
-            edit["*.s.sol"] = _ALLOW
+            if spec.write_allow:
+                # Exclusive allow-list: deny everything, then re-allow the named globs. The blanket
+                # deny is emitted first so the specific allows win under last-match-wins.
+                edit["**"] = _DENY
+                for pattern in spec.write_allow:
+                    edit[_anchor(prefix, pattern)] = _ALLOW
+            # Denies are emitted last so they override the allow floor and any write_allow re-allow.
+            for pattern in spec.write_deny:
+                edit[_anchor(prefix, pattern)] = _DENY
         if edit:
             config["edit"] = edit
     else:

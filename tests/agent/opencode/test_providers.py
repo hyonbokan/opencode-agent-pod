@@ -16,7 +16,7 @@ from agent.opencode.providers import (
     to_opencode_model,
     to_opencode_variant,
 )
-from llm import ThinkingEffort
+from llm import ReasoningEffort
 from llm.models import AnthropicModels, GeminiModels, GrokModels, OpenAIModels
 
 
@@ -72,30 +72,30 @@ def test_build_daemon_env_prefers_direct_key_and_invents_nothing():
     "effort,model,expected",
     [
         # Anthropic exposes only high/max; lower efforts have no variant and run at the default.
-        (ThinkingEffort.LOW, "anthropic/claude-haiku-4-5", None),
-        (ThinkingEffort.MEDIUM, "anthropic/claude-haiku-4-5", None),
-        (ThinkingEffort.HIGH, "anthropic/claude-haiku-4-5", "high"),
-        (ThinkingEffort.MAX, "anthropic/claude-haiku-4-5", "max"),
+        (ReasoningEffort.LOW, "anthropic/claude-haiku-4-5", None),
+        (ReasoningEffort.MEDIUM, "anthropic/claude-haiku-4-5", None),
+        (ReasoningEffort.HIGH, "anthropic/claude-haiku-4-5", "high"),
+        (ReasoningEffort.MAX, "anthropic/claude-haiku-4-5", "max"),
         # OpenAI exposes low/medium/high directly; MAX clamps to xhigh only where the model offers
         # it (gpt-5.4*/gpt-5.5*), otherwise high — sending an unsupported variant is silently ignored.
-        (ThinkingEffort.LOW, "openai/gpt-5-nano", "low"),
-        (ThinkingEffort.MEDIUM, "openai/gpt-5-nano", "medium"),
-        (ThinkingEffort.HIGH, "openai/gpt-5-nano", "high"),
-        (ThinkingEffort.MAX, "openai/gpt-5-nano", "high"),
-        (ThinkingEffort.MAX, "openai/gpt-5.5", "xhigh"),
-        (ThinkingEffort.MAX, "openai/gpt-5.4-mini", "xhigh"),
+        (ReasoningEffort.LOW, "openai/gpt-5-nano", "low"),
+        (ReasoningEffort.MEDIUM, "openai/gpt-5-nano", "medium"),
+        (ReasoningEffort.HIGH, "openai/gpt-5-nano", "high"),
+        (ReasoningEffort.MAX, "openai/gpt-5-nano", "high"),
+        (ReasoningEffort.MAX, "openai/gpt-5.5", "xhigh"),
+        (ReasoningEffort.MAX, "openai/gpt-5.4-mini", "xhigh"),
         # Google exposes low/medium/high; it has no xhigh/max, so MAX clamps to high.
-        (ThinkingEffort.MEDIUM, "google/gemini-3.1-pro", "medium"),
-        (ThinkingEffort.MAX, "google/gemini-3.1-pro", "high"),
+        (ReasoningEffort.MEDIUM, "google/gemini-3.1-pro", "medium"),
+        (ReasoningEffort.MAX, "google/gemini-3.1-pro", "high"),
         # xAI has no xhigh, so MAX clamps to high.
-        (ThinkingEffort.MAX, "xai/grok-4-1-fast-reasoning", "high"),
+        (ReasoningEffort.MAX, "xai/grok-4-1-fast-reasoning", "high"),
         # No effort requested -> no variant, on any provider.
         (None, "openai/gpt-5-nano", None),
         (None, "anthropic/claude-haiku-4-5", None),
         # Custom (non-catalog) providers get no variant regardless of effort — we don't know their
         # effort support, and a strict OpenAI-compatible endpoint may reject an unexpected param.
-        (ThinkingEffort.MEDIUM, "vllm/llama-bgp", None),
-        (ThinkingEffort.MAX, "vllm/llama-bgp", None),
+        (ReasoningEffort.MEDIUM, "vllm/llama-bgp", None),
+        (ReasoningEffort.MAX, "vllm/llama-bgp", None),
     ],
 )
 def test_to_opencode_variant(effort, model, expected):

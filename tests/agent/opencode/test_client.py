@@ -14,7 +14,6 @@ from pydantic import BaseModel
 
 from agent.errors import SessionStartError
 from agent.opencode.client import (
-    _MCP_TOOL_IDS,
     _SessionWatcher,
     build_message_body,
     mcp_local_config,
@@ -26,7 +25,12 @@ from agent.opencode.driver import build_timeline
 from agent.opencode.server import OpencodeServer
 from agent.permissions import PermissionSpec
 from agent.runner import OpencodeRunner
-from core.tools.mcp import MCP_SERVER_NAME
+from core.tools.mcp import McpServer, mcp_tool_ids
+
+_DEMO_SERVER = McpServer(name="demo", command=("python", "srv.py"), tools=("lookup", "fetch"))
+_DEMO_SERVERS_JSON = json.dumps(
+    [{"name": "demo", "command": ["python", "srv.py"], "tools": ["lookup", "fetch"]}]
+)
 
 
 class _Findings(BaseModel):
@@ -95,14 +99,17 @@ def test_build_message_body_never_sends_tools_map():
     assert "tools" not in body
 
 
-def test_to_permission_ruleset_gates_mcp_tools_by_allow_list():
-    assert _MCP_TOOL_IDS  # the MCP server exposes tools to gate
-    one = _MCP_TOOL_IDS[0]
+def test_to_permission_ruleset_gates_mcp_tools_by_allow_list(monkeypatch):
+    # A deployment declares an MCP server via config; its tools are gated by the per-run allow-list.
+    monkeypatch.setenv("AGENT_MCP_SERVERS", _DEMO_SERVERS_JSON)
+    tool_ids = mcp_tool_ids()
+    assert tool_ids  # the configured server exposes tools to gate
+    one = tool_ids[0]
 
     # An allow-list naming one MCP tool denies every other MCP tool with a "*"-pattern deny rule
     # (which is what makes opencode hide the tool), and leaves the named one unruled (defaults on).
     tuples = _tuples(to_permission_ruleset(PermissionSpec(), ["read", one], "/work"))
-    for tool_id in _MCP_TOOL_IDS:
+    for tool_id in tool_ids:
         if tool_id == one:
             assert not any(perm == tool_id for perm, _, _ in tuples)
         else:
@@ -110,18 +117,22 @@ def test_to_permission_ruleset_gates_mcp_tools_by_allow_list():
 
     # An allow-list naming none of them denies them all.
     none_tuples = _tuples(to_permission_ruleset(PermissionSpec(), ["read"], "/work"))
-    assert all((tool_id, "*", "deny") in none_tuples for tool_id in _MCP_TOOL_IDS)
+    assert all((tool_id, "*", "deny") in none_tuples for tool_id in tool_ids)
 
 
-def test_mcp_local_config_omits_emit_and_carries_project_dir():
-    config = mcp_local_config("/work/project")
+def test_to_permission_ruleset_gates_nothing_when_no_servers_configured(monkeypatch):
+    # With no MCP servers declared, the ruleset carries no MCP deny rules — only the built-in gating.
+    monkeypatch.delenv("AGENT_MCP_SERVERS", raising=False)
+    tuples = _tuples(to_permission_ruleset(PermissionSpec(), ["read"], "/work"))
+    assert not any(perm.startswith("demo_") for perm, _, _ in tuples)
+
+
+def test_mcp_local_config_builds_local_config_from_server_command():
+    config = mcp_local_config(_DEMO_SERVER)
     assert config["type"] == "local"
     assert config["enabled"] is True
-    command = config["command"]
-    assert command[1].endswith("mcp_server.py")
-    assert command[2:] == ["--project-dir", "/work/project", "--with-tools"]
-    # serve produces structured output via `format`, so the emit half is absent.
-    assert "--emit-model" not in command
+    # The command is the server's declared argv, verbatim — the pod injects nothing.
+    assert config["command"] == ["python", "srv.py"]
 
 
 @pytest.mark.asyncio
@@ -131,20 +142,20 @@ async def test_register_mcp_posts_config_and_returns_status():
     def handler(request: httpx.Request) -> httpx.Response:
         seen["path"] = request.url.path
         seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json={MCP_SERVER_NAME: {"status": "connected"}})
+        return httpx.Response(200, json={_DEMO_SERVER.name: {"status": "connected"}})
 
     client = _mock_client(handler)
     try:
         status = await register_mcp(
-            "http://d", MCP_SERVER_NAME, mcp_local_config("/work"), client=client
+            "http://d", _DEMO_SERVER.name, mcp_local_config(_DEMO_SERVER), client=client
         )
     finally:
         await client.aclose()
 
     assert seen["path"] == "/mcp"
-    assert seen["body"]["name"] == MCP_SERVER_NAME
+    assert seen["body"]["name"] == _DEMO_SERVER.name
     assert seen["body"]["config"]["type"] == "local"
-    assert status[MCP_SERVER_NAME]["status"] == "connected"
+    assert status[_DEMO_SERVER.name]["status"] == "connected"
 
 
 @pytest.mark.asyncio
@@ -154,14 +165,14 @@ async def test_register_mcp_raises_when_server_fails_to_connect():
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            json={MCP_SERVER_NAME: {"status": "failed", "error": "MCP error -32000"}},
+            json={_DEMO_SERVER.name: {"status": "failed", "error": "MCP error -32000"}},
         )
 
     client = _mock_client(handler)
     try:
         with pytest.raises(RuntimeError, match="failed to connect.*-32000"):
             await register_mcp(
-                "http://d", MCP_SERVER_NAME, mcp_local_config("/work"), client=client
+                "http://d", _DEMO_SERVER.name, mcp_local_config(_DEMO_SERVER), client=client
             )
     finally:
         await client.aclose()
