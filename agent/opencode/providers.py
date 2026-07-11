@@ -36,6 +36,29 @@ _CATALOG_PROVIDERS: frozenset[str] = frozenset({"anthropic", "openai", "google",
 #   AGENT_CUSTOM_PROVIDERS='[{"name":"vllm","base_url":"http://host:8000/v1","models":["llama-bgp"]}]'
 _CUSTOM_PROVIDERS_ENV = "AGENT_CUSTOM_PROVIDERS"
 
+# When this env var holds a running proxy's base URL, the daemon environment carries no real provider
+# key: every provider is pointed at ``<proxy>/<provider>`` with a dummy key instead, so a shell
+# command the daemon spawns cannot read one.
+KEY_PROXY_ENV = "AGENT_KEY_PROXY_URL"
+
+# The placeholder key the daemon and the commands it spawns see instead of a real one. It is
+# worthless, but opencode still wants *a* key set so a provider isn't skipped as unconfigured.
+DUMMY_PROXY_KEY = "opencode-agent-pod-proxied-key"
+
+# opencode catalog provider segment -> the env var(s) that may carry its real key, most-specific
+# first.
+CATALOG_KEY_VARS: dict[str, tuple[str, ...]] = {
+    "anthropic": ("ANTHROPIC_API_KEY",),
+    "openai": ("OPENAI_API_KEY",),
+    "google": ("GOOGLE_GENERATIVE_AI_API_KEY", "GEMINI_API_KEY"),
+    "xai": ("XAI_API_KEY",),
+}
+
+# Every env var that carries a real provider key — stripped from the daemon env in proxied mode.
+_PROVIDER_KEY_VARS: tuple[str, ...] = tuple(
+    dict.fromkeys(var for vars_ in CATALOG_KEY_VARS.values() for var in vars_)
+)
+
 
 class CustomProvider(BaseModel):
     """A custom OpenAI-compatible provider the pod can address — a model served at an arbitrary
@@ -151,17 +174,60 @@ def provider_of(opencode_model: str) -> str:
     return opencode_model.split("/", 1)[0]
 
 
-def build_daemon_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
-    """Build the environment for an ``opencode serve`` daemon, applying every provider key alias.
+def _proxied_provider_config(env: Mapping[str, str], proxy_url: str) -> dict[str, Any] | None:
+    """Build opencode provider config that points every keyed provider at the proxy with a dummy key.
 
-    A single daemon serves any provider's model over its lifetime, so it copies each aliased key
-    across when the variable opencode reads is unset but the source key is held (Gemini's
-    GEMINI_API_KEY → GOOGLE_GENERATIVE_AI_API_KEY). A key absent everywhere is left absent, never
-    blanked. Any custom OpenAI-compatible providers (AGENT_CUSTOM_PROVIDERS) are compiled into
-    OPENCODE_CONFIG_CONTENT so the daemon can address their models too; an explicit
-    OPENCODE_CONFIG_CONTENT already in the environment is left untouched.
+    A catalog provider is included only when a real key for it is present; a custom provider is always
+    included. Each entry overrides only the provider's base URL and key, so the daemon never holds a
+    real one. Returns None when there is nothing to route.
+    """
+    base = proxy_url.rstrip("/")
+    provider_map: dict[str, Any] = {}
+    for seg, key_vars in CATALOG_KEY_VARS.items():
+        if any(env.get(var) for var in key_vars):
+            provider_map[seg] = {"options": {"baseURL": f"{base}/{seg}", "apiKey": DUMMY_PROXY_KEY}}
+    for p in load_custom_providers(env):
+        provider_map[p.name] = {
+            "npm": p.npm,
+            "name": p.name,
+            "options": {"baseURL": f"{base}/{p.name}", "apiKey": DUMMY_PROXY_KEY},
+            "models": {model: {"name": model} for model in p.models},
+        }
+    return {"provider": provider_map} if provider_map else None
+
+
+def _build_proxied_daemon_env(env: dict[str, str], proxy_url: str) -> dict[str, str]:
+    """Build the daemon environment with every real provider key removed and each provider routed
+    through the proxy.
+
+    A shell command the daemon spawns inherits this environment, so with the keys gone it cannot read
+    one. An explicit OPENCODE_CONFIG_CONTENT is left untouched.
+    """
+    out = dict(env)
+    for var in _PROVIDER_KEY_VARS:
+        out.pop(var, None)
+    if not out.get("OPENCODE_CONFIG_CONTENT"):
+        config = _proxied_provider_config(env, proxy_url)
+        if config is not None:
+            out["OPENCODE_CONFIG_CONTENT"] = json.dumps(config)
+    return out
+
+
+def build_daemon_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Build the environment for an ``opencode serve`` daemon.
+
+    When ``AGENT_KEY_PROXY_URL`` is set, every real provider key is stripped and each provider is
+    pointed at that proxy with a dummy key, so no key reaches the daemon or the commands it spawns.
+    Otherwise a single daemon serves any provider directly: each aliased key is copied across when the
+    variable opencode reads is unset but the source key is held (GEMINI_API_KEY →
+    GOOGLE_GENERATIVE_AI_API_KEY), a key absent everywhere is left absent rather than blanked, and any
+    custom OpenAI-compatible providers declared in AGENT_CUSTOM_PROVIDERS are compiled into
+    OPENCODE_CONFIG_CONTENT. An explicit OPENCODE_CONFIG_CONTENT is left untouched.
     """
     env = dict(base_env if base_env is not None else os.environ)
+    proxy_url = env.get(KEY_PROXY_ENV)
+    if proxy_url:
+        return _build_proxied_daemon_env(env, proxy_url)
     for var, alias in _KEY_ALIAS.items():
         if not env.get(var) and env.get(alias):
             env[var] = env[alias]

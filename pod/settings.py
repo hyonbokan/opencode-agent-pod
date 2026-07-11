@@ -27,11 +27,21 @@ class PodSettings:
     keepalive_seconds: float
     host: str
     port: int
+    # Run the key-injecting proxy so provider keys never enter the daemon or the shell it spawns.
+    # On by default — it is what makes a shell-enabled run safe. Disable only for local debugging.
+    key_proxy_enabled: bool
+    # Interface the proxy binds. 127.0.0.1 keeps it unreachable off-host regardless of the pod's bind.
+    key_proxy_host: str
 
 
 def _float_or_none(name: str) -> float | None:
     raw = os.getenv(name)
     return float(raw) if raw else None
+
+
+def _bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    return default if raw is None else raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def load_settings() -> PodSettings:
@@ -45,4 +55,6 @@ def load_settings() -> PodSettings:
         keepalive_seconds=float(os.getenv("AGENT_POD_KEEPALIVE_SECONDS", "15")),
         host=os.getenv("AGENT_POD_HOST", "127.0.0.1"),
         port=int(os.getenv("AGENT_POD_PORT", "8080")),
+        key_proxy_enabled=_bool("AGENT_POD_KEY_PROXY", True),
+        key_proxy_host=os.getenv("AGENT_POD_KEY_PROXY_HOST", "127.0.0.1"),
     )

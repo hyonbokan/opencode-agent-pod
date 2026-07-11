@@ -7,6 +7,7 @@ budget-capped and workspace-isolated, and daemons are drained at shutdown. Not a
 from __future__ import annotations
 
 import hmac
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -14,7 +15,10 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 
 from agent.opencode.daemon_pool import shutdown_opencode_daemons
+from agent.opencode.providers import KEY_PROXY_ENV
 from agent.runner import flush_pending_traces
+from core.utils.logger import logger
+from pod.key_proxy import KeyProxy, build_routes
 from pod.schema import RunRequest
 from pod.service import drain_cleanups, run_events
 from pod.settings import PodSettings, load_settings
@@ -27,11 +31,27 @@ def create_app(settings: PodSettings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        yield
-        # Let in-flight run cleanups finish, drain traces, then reap any daemon still pooled.
-        await drain_cleanups()
-        await flush_pending_traces()
-        await shutdown_opencode_daemons()
+        # Start the key-injecting proxy first and publish its URL through AGENT_KEY_PROXY_URL, so
+        # every daemon launched after this routes providers through it with a dummy key and no real
+        # key ever reaches a shell command the daemon spawns.
+        proxy: KeyProxy | None = None
+        if settings.key_proxy_enabled:
+            proxy = KeyProxy(build_routes(dict(os.environ)), host=settings.key_proxy_host)
+            await proxy.start()
+            os.environ[KEY_PROXY_ENV] = proxy.base_url
+        else:
+            logger.warning("key proxy disabled: provider keys are visible to the shell tool")
+        try:
+            yield
+        finally:
+            # Let in-flight run cleanups finish, drain traces, then reap any daemon still pooled,
+            # and only then stop the proxy the daemons were talking to.
+            await drain_cleanups()
+            await flush_pending_traces()
+            await shutdown_opencode_daemons()
+            if proxy is not None:
+                os.environ.pop(KEY_PROXY_ENV, None)
+                await proxy.stop()
 
     app = FastAPI(title="opencode-agent-pod", lifespan=lifespan)
 

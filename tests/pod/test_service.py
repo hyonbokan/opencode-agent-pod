@@ -24,6 +24,8 @@ _BASE_SETTINGS = PodSettings(
     keepalive_seconds=0.02,
     host="127.0.0.1",
     port=8080,
+    key_proxy_enabled=False,
+    key_proxy_host="127.0.0.1",
 )
 
 

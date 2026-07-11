@@ -8,6 +8,7 @@ import json
 import pytest
 
 from agent.opencode.providers import (
+    DUMMY_PROXY_KEY,
     CustomProvider,
     build_daemon_env,
     build_provider_config,
@@ -171,3 +172,47 @@ def test_build_daemon_env_leaves_config_content_alone_when_no_custom_providers_o
         }
     )
     assert env["OPENCODE_CONFIG_CONTENT"] == '{"explicit": true}'
+
+
+def test_build_daemon_env_strips_real_keys_and_routes_through_the_proxy():
+    # With a proxy URL set, no real key survives in the daemon env, and every keyed provider is
+    # pointed at the proxy with the dummy key instead.
+    env = build_daemon_env(
+        {
+            "AGENT_KEY_PROXY_URL": "http://127.0.0.1:9",
+            "ANTHROPIC_API_KEY": "secret-anthropic",
+            "GEMINI_API_KEY": "secret-gemini",
+        }
+    )
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "GEMINI_API_KEY" not in env
+    assert "GOOGLE_GENERATIVE_AI_API_KEY" not in env
+    config = json.loads(env["OPENCODE_CONFIG_CONTENT"])["provider"]
+    assert config["anthropic"]["options"]["baseURL"] == "http://127.0.0.1:9/anthropic"
+    assert config["google"]["options"]["baseURL"] == "http://127.0.0.1:9/google"
+    assert config["anthropic"]["options"]["apiKey"] == DUMMY_PROXY_KEY
+    assert "secret-anthropic" not in json.dumps(config)  # the real key is nowhere in the config
+    assert "openai" not in config  # no OpenAI key present, so it is not routed
+
+
+def test_build_daemon_env_routes_custom_providers_through_the_proxy_too():
+    env = build_daemon_env(
+        {
+            "AGENT_KEY_PROXY_URL": "http://127.0.0.1:9",
+            "VLLM_KEY": "secret-vllm",
+            "AGENT_CUSTOM_PROVIDERS": json.dumps(
+                [
+                    {
+                        "name": "vllm",
+                        "base_url": "http://h:8000/v1",
+                        "models": ["llama-bgp"],
+                        "api_key_env": "VLLM_KEY",
+                    }
+                ]
+            ),
+        }
+    )
+    entry = json.loads(env["OPENCODE_CONFIG_CONTENT"])["provider"]["vllm"]
+    assert entry["options"]["baseURL"] == "http://127.0.0.1:9/vllm"  # proxy, not the real base_url
+    assert entry["options"]["apiKey"] == DUMMY_PROXY_KEY
+    assert "secret-vllm" not in json.dumps(entry)
