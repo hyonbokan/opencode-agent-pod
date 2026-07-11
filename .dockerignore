@@ -1,0 +1,18 @@
+# Keep the build context small and never ship secrets or dev-only files into the image.
+.git/
+.venv/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Secrets — never copy into an image layer.
+.env
+.env.*
+
+# Not needed at runtime.
+tests/
+scripts/
+*.md
+.pre-commit-config.yaml

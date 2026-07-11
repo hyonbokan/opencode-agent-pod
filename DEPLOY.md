@@ -1,11 +1,50 @@
-# Deployment: egress control for the `Bash` tool
+# Deployment
 
-This is the deploy-time half of the pod's security posture (DESIGN §11). The in-process
-**key-injecting proxy** (DESIGN §7, `pod/key_proxy.py`) already removes provider keys from the
-daemon and its `Bash` children — so a run can no longer *read* a key. What remains is a
-**network** concern the pod process cannot enforce from Python: an LLM-authored `Bash` script
-could still open its own socket to an arbitrary host and exfiltrate the **workspace data** it was
-given. Blocking that is an egress allowlist applied to the container/host the pod runs in.
+How to build and run the pod as a container, and how to apply the network egress control that the
+pod process cannot enforce itself.
+
+## Build & run the image
+
+The `Dockerfile` bundles the FastAPI/SSE service with a pinned `opencode` binary (`OPENCODE_VERSION`,
+default 1.17.11) and the Node runtime opencode needs.
+
+```bash
+# Build (add --platform linux/amd64 when the target host is x86).
+docker build -t opencode-agent-pod:dev .
+
+# Run. AGENT_POD_TOKEN is required — the pod refuses every request (503) without it. Provider keys
+# are passed as env/secrets; the key proxy keeps them out of the daemon and its Bash children, so
+# handing them to the pod process is the intended, safe path.
+docker run --rm -p 8080:8080 \
+  -e AGENT_POD_TOKEN=$POD_TOKEN \
+  -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
+  opencode-agent-pod:dev
+```
+
+`GET /health` answers `{"status":"ok"}` once up. All other config is `AGENT_POD_*` env (see
+`pod/settings.py`); the container binds `0.0.0.0` and runs as a non-root user.
+
+Runtime config worth knowing:
+
+- **`AGENT_POD_TOKEN`** (required) — the shared bearer token; unset means fail-closed (503).
+- **Provider keys** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) — mount as secrets, never bake into a
+  layer. The key proxy is on by default (`AGENT_POD_KEY_PROXY=1`).
+- **Budget/turn/timeout caps** — `AGENT_POD_MAX_BUDGET_USD`, `AGENT_POD_MAX_TURNS`,
+  `AGENT_POD_SESSION_TIMEOUT`.
+
+**Custom (vLLM) providers and egress:** opencode installs `@ai-sdk/*` packages from the npm registry
+on first use of a custom OpenAI-compatible provider. The egress allowlist below blocks that, so
+either pre-warm the package at build time or allow the npm registry for those deployments. The
+catalog GPT/Anthropic path bundles its SDKs in the binary and needs no runtime install.
+
+## Egress control for the `Bash` tool
+
+This is the deploy-time half of the pod's security posture (DESIGN §11). The in-process key-injecting
+proxy (DESIGN §7, `pod/key_proxy.py`) already removes provider keys from the daemon and its `Bash`
+children, so a run can no longer read a key. What remains is a network concern the pod process cannot
+enforce from Python: an LLM-authored `Bash` script could still open its own socket to an arbitrary
+host and exfiltrate the workspace data it was given. Blocking that is an egress allowlist applied to
+the container/host the pod runs in.
 
 The pod does not implement this itself on purpose: a firewall enforced by the same process that runs
 the untrusted code is not a real boundary. Enforce it one layer out, at the network.
