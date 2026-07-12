@@ -12,22 +12,25 @@ a code-executing sandbox, and the provider keys, so the caller embeds none of th
 
 ## Why this exists
 
-opencode is an excellent agent runtime — native tools (`Read`, `Write`, `Edit`, `Bash`, `Glob`,
-`Grep`) plus MCP, a real tool loop, structured output — but it is built for a **human in the loop**.
+CLI coding agents like opencode and Claude Code are remarkably capable — native tools (`Read`,
+`Write`, `Edit`, `Bash`, `Glob`, `Grep`) plus MCP, a real multi-turn tool loop, structured output.
+But they are built to be **driven by a human at a terminal**, one approved step at a time.
 
-Most steps in an autonomous pipeline are cheap, deterministic, and belong in plain code. Occasionally
-one step needs an agent that can *write a script, run it, read the output, and fix itself* — unattended,
-in an **isolated sandbox**. This pod is that one step, extracted into a service so you don't rebuild
-the opencode binary, daemon lifecycle, key custody, and sandbox in every caller:
+This pod makes that same capability **programmable and fully autonomous**. POST a task and the agent
+runs a complete loop on its own — plan, run code, read the output, correct itself — streaming the
+trace back and returning a result. What ships is the runtime an autonomous agent actually needs —
+daemon lifecycle, per-request sandbox, key custody — not just an HTTP route over a binary, so a
+caller embeds none of it. And because the toolset is general, it reaches well beyond coding: the same
+service drives BGP routing analysis and customs-document review (see [Who uses it](#who-uses-it)).
 
 - **Autonomous, not interactive** — one request is one self-contained run that loops as many turns as
   it needs, streaming its reason → execute → observe trace.
+- **General-purpose** — the pod knows nothing domain-specific; give it a prompt, tools, and staged
+  data and it does the task, coding or not.
 - **Native tools + MCP, sandboxed** — real `Bash`/`Read`/`Write` and any MCP servers you register, run
   against a per-request throwaway workspace, not your host.
 - **Keys never cross the boundary** — provider keys stay inside the pod; callers send prompts and get
   results, never a key (see [Security](#security)).
-- **Reusable** — the pod knows nothing domain-specific, so one container serves any caller (see
-  [Who uses it](#who-uses-it)).
 
 ## The core idea: a stateless compute primitive
 
