@@ -5,7 +5,7 @@ import time
 from pydantic import BaseModel
 
 from agent.models import DEFAULT_TOOLS, OpencodeResult
-from agent.opencode.client import run_session
+from agent.opencode.client import EventSink, run_session
 from agent.opencode.daemon_pool import get_opencode_daemon
 from agent.opencode.driver import DriverResult, TimelineStep
 from agent.opencode.providers import to_opencode_model, to_opencode_variant
@@ -94,9 +94,11 @@ class OpencodeRunner:
         cwd: str,
         max_budget_usd: float | None = None,
         permission: PermissionSpec | None = None,
+        event_sink: EventSink | None = None,
     ) -> OpencodeResult:
         """Run one query on a shared serve daemon under the concurrency limiter, then validate any
-        structured output against the response model."""
+        structured output against the response model. When ``event_sink`` is given it receives the
+        run's live text deltas and tool-call transitions as they arrive."""
         spec = permission or PermissionSpec()
         budget = max_budget_usd if max_budget_usd is not None else self._max_budget_usd
         opencode_model = to_opencode_model(self._model)
@@ -118,6 +120,7 @@ class OpencodeRunner:
                 opencode_model=opencode_model,
                 variant=variant,
                 budget=budget,
+                event_sink=event_sink,
             )
 
         # Record the trace off the critical path: the agent call shouldn't wait on Langfuse ingestion
@@ -156,6 +159,7 @@ class OpencodeRunner:
         opencode_model: str,
         variant: str | None,
         budget: float | None,
+        event_sink: EventSink | None = None,
     ) -> tuple[OpencodeResult, list[TimelineStep] | None]:
         """Run one query on a serve daemon and return the result plus its event timeline.
 
@@ -184,6 +188,7 @@ class OpencodeRunner:
                     timeout=self._session_timeout,
                     max_budget_usd=budget,
                     max_turns=self._max_turns,
+                    event_sink=event_sink,
                 )
                 return self._to_result(driver_result), driver_result.timeline
             except Exception as e:

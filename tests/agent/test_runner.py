@@ -98,6 +98,19 @@ async def test_system_prompt_optional(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_threads_event_sink_into_session(tmp_path):
+    # The live-event sink a caller passes to run() must reach run_session, which hands it to the
+    # watcher; the runner only threads it through.
+    capture: dict = {}
+    sink = lambda _event: None  # noqa: E731
+    with _patch_serve(capture=capture):
+        await OpencodeRunner(model="claude-sonnet-4-6", max_retries=0).run(
+            user_message="x", cwd=str(tmp_path), event_sink=sink
+        )
+    assert capture["event_sink"] is sink
+
+
+@pytest.mark.asyncio
 async def test_threads_budget_and_turn_cap_into_session(tmp_path):
     capture: dict = {}
     with _patch_serve(capture=capture):

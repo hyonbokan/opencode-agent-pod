@@ -589,6 +589,97 @@ def test_watched_steps_carry_timing_into_the_timeline():
     assert step.end_ms >= step.start_ms
 
 
+def test_session_watcher_streams_token_deltas_and_tool_transitions():
+    # With a sink set, the watcher pushes a live update per real change: a text part yields only its
+    # newly-appended tail (opencode resends the whole text each update), and a tool part yields one
+    # event per status transition carrying input and, once done, output.
+    events: list[dict] = []
+    w = _SessionWatcher("s", max_budget_usd=None, max_turns=None, event_sink=events.append)
+
+    # A generation step opens the assistant message; only then is its text streamed as output.
+    w.process(_pev({"type": "step-start", "id": "s1", "messageID": "m1"}))
+    w.process(_pev({"type": "text", "id": "t1", "text": "Hel", "messageID": "m1"}))
+    w.process(_pev({"type": "text", "id": "t1", "text": "Hello wor", "messageID": "m1"}))
+    w.process(
+        _pev({"type": "text", "id": "t1", "text": "Hello wor", "messageID": "m1"})
+    )  # no new text
+    w.process(_pev({"type": "text", "id": "t1", "text": "Hello world", "messageID": "m1"}))
+
+    tool_running = {"status": "running", "input": {"command": "ls"}}
+    tool_done = {"status": "completed", "input": {"command": "ls"}, "output": "a\nb\n"}
+    w.process(
+        _pev({"type": "tool", "id": "b1", "tool": "bash", "messageID": "m1", "state": tool_running})
+    )
+    w.process(
+        _pev({"type": "tool", "id": "b1", "tool": "bash", "messageID": "m1", "state": tool_running})
+    )  # same status
+    w.process(
+        _pev({"type": "tool", "id": "b1", "tool": "bash", "messageID": "m1", "state": tool_done})
+    )
+
+    # A step-finish is a turn, not a live update, so it never reaches the sink.
+    w.process(_pev({"type": "step-finish", "cost": 0.001, "messageID": "m1"}))
+
+    assert events == [
+        {"kind": "token", "text": "Hel"},
+        {"kind": "token", "text": "lo wor"},
+        {"kind": "token", "text": "ld"},
+        {
+            "kind": "tool",
+            "id": "b1",
+            "name": "bash",
+            "status": "running",
+            "input": {"command": "ls"},
+        },
+        {
+            "kind": "tool",
+            "id": "b1",
+            "name": "bash",
+            "status": "completed",
+            "input": {"command": "ls"},
+            "output": "a\nb\n",
+        },
+    ]
+
+
+def test_session_watcher_does_not_stream_the_echoed_prompt():
+    # opencode re-emits the user's own prompt as a text part with no generation step. That must not
+    # be restreamed as assistant output, or a caller renders its own prompt back as the answer.
+    events: list[dict] = []
+    w = _SessionWatcher("s", max_budget_usd=None, max_turns=None, event_sink=events.append)
+
+    # The echoed prompt arrives first, on a message with no step — dropped.
+    w.process(_pev({"type": "text", "id": "u1", "text": "analyze prefix X", "messageID": "user-m"}))
+    # The assistant then generates: its message opens a step, so its text streams.
+    w.process(_pev({"type": "step-start", "id": "s1", "messageID": "asst-m"}))
+    w.process(_pev({"type": "text", "id": "a1", "text": "Result: ", "messageID": "asst-m"}))
+
+    assert events == [{"kind": "token", "text": "Result: "}]  # only the assistant's text
+
+
+def test_session_watcher_without_a_sink_emits_nothing_extra():
+    # The sink is opt-in: the default watcher still tracks cost/turns/timeline and simply skips the
+    # live-event path, so nothing changes for callers that don't want a live trace.
+    w = _SessionWatcher("s", max_budget_usd=None, max_turns=None)
+    w.process(_pev({"type": "text", "id": "t1", "text": "hi", "messageID": "m1"}))
+    assert w.turns == 0
+    assert len(w.part_snapshots) == 1  # timeline still recorded
+
+
+def test_session_watcher_swallows_a_raising_sink():
+    # A live update is best-effort UX: a sink that raises must never break cap accounting.
+    def boom(_event: dict) -> None:
+        raise RuntimeError("consumer went away")
+
+    w = _SessionWatcher("s", max_budget_usd=0.004, max_turns=None, event_sink=boom)
+    w.process(_pev({"type": "step-start", "id": "s1", "messageID": "m1"}))
+    w.process(
+        _pev({"type": "text", "id": "t1", "text": "hi", "messageID": "m1"})
+    )  # sink raises here
+    assert w.process(_pev({"type": "step-finish", "cost": 0.005, "messageID": "m1"})) is True
+    assert w.budget_exceeded is True  # accounting unaffected by the failing sink
+
+
 def test_driver_result_feeds_existing_result_mapping():
     # The serve DriverResult must classify through the same _to_result the run driver uses.
     from agent.opencode.driver import DriverResult, ParsedRun

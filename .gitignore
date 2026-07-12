@@ -38,8 +38,6 @@ ENV/
 # --- Internal design / planning / handoff docs (kept LOCAL, never published) ---
 # .gitignore does NOT delete these — they remain on disk, just untracked. Move
 # any doc here that carries internal strategy, provenance, or security detail.
-AGENTS.md
-CLAUDE.md
 DESIGN.md
 DEPLOY.md
 PLAN.md

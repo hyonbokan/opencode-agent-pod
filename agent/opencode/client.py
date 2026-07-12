@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import json
 import time
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -26,6 +27,7 @@ from agent.opencode.providers import provider_of
 from agent.opencode.server import OpencodeServer
 from agent.permissions import PermissionSpec
 from core.tools.mcp import McpServer, mcp_tool_ids
+from core.utils.logger import logger
 
 # Retries opencode makes internally to coax a schema-valid structured output before giving up.
 _STRUCTURED_RETRY_COUNT = 2
@@ -135,6 +137,12 @@ _PART_TYPE_MAP: dict[str, str] = {
     "text": "text",
 }
 
+# A sink for live per-event updates as a run works: assistant-text deltas (``{"kind": "token",
+# "text": …}``) and tool-call state transitions (``{"kind": "tool", "id", "name", "status",
+# "input"?, "output"?}``). Invoked synchronously as events arrive so a caller can stream progress.
+# Best-effort — a sink that raises is logged and swallowed so it can never disturb cap enforcement.
+EventSink = Callable[[dict[str, Any]], None]
+
 
 class _SessionWatcher:
     """Track one session's cost, turns, and timeline from the event stream, flagging when a budget or
@@ -145,7 +153,11 @@ class _SessionWatcher:
     """
 
     def __init__(
-        self, session_id: str, max_budget_usd: float | None, max_turns: int | None
+        self,
+        session_id: str,
+        max_budget_usd: float | None,
+        max_turns: int | None,
+        event_sink: EventSink | None = None,
     ) -> None:
         self.session_id = session_id
         self._budget = max_budget_usd
@@ -160,6 +172,16 @@ class _SessionWatcher:
         self._parts: dict[str, dict[str, Any]] = {}
         self._anon_seq = 0  # synthetic keys for a part with no id, so those are never merged
         self.idle = asyncio.Event()
+        # Live-update sink plus the per-part state that keeps its stream free of the snapshot spam:
+        # how many chars of each text part were already emitted (so only the new tail is sent) and the
+        # last tool status emitted per part (so each transition, not every republished snapshot, fires).
+        self._event_sink = event_sink
+        self._emitted_text: dict[str, int] = {}
+        self._emitted_tool_status: dict[str, str] = {}
+        # Message ids that opened a generation step. opencode also re-emits the user's own prompt as a
+        # text part (with no step), so text is streamed only for messages seen here — the assistant's,
+        # not the echoed prompt.
+        self._generating_messages: set[str] = set()
 
     @property
     def part_snapshots(self) -> list[dict[str, Any]]:
@@ -187,6 +209,11 @@ class _SessionWatcher:
                 "part": part,
                 "timestamp": int(time.time() * 1000),
             }
+            if run_type in ("step_start", "step_finish"):
+                message_id = part.get("messageID")
+                if isinstance(message_id, str):
+                    self._generating_messages.add(message_id)
+            self._emit_live(part_id, run_type, part)
         if part.get("type") != "step-finish":
             return False
         self.turns += 1
@@ -202,6 +229,62 @@ class _SessionWatcher:
             self.turns_exceeded = True
             return True
         return False
+
+    def _emit_live(self, part_id: str, run_type: str, part: dict[str, Any]) -> None:
+        """Push a live update — a text delta or a tool-call transition — to the sink, if one is set.
+        Best-effort: a failing sink is logged and swallowed so it can't disturb cap enforcement."""
+        if self._event_sink is None:
+            return
+        event = self._live_event(part_id, run_type, part)
+        if event is None:
+            return
+        try:
+            self._event_sink(event)
+        except Exception as e:
+            logger.debug("live event sink raised; dropping update: %s", e)
+
+    def _live_event(
+        self, part_id: str, run_type: str, part: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Normalize a part update into a live event, or None when it carries nothing new.
+
+        A text part yields only its newly-appended tail — opencode resends the whole text on every
+        update, so the delta against what was already emitted is sent — and only for an assistant
+        message, so the prompt opencode echoes back as a text part is not restreamed as output. A
+        tool part yields one event per status transition (pending → running → completed), carrying
+        the call's input and, once it finishes, its output; the repeated same-status snapshots in
+        between are dropped.
+        """
+        if run_type == "text":
+            if part.get("messageID") not in self._generating_messages:
+                return None
+            full = part.get("text")
+            if not isinstance(full, str):
+                return None
+            seen = self._emitted_text.get(part_id, 0)
+            if len(full) <= seen:
+                return None
+            self._emitted_text[part_id] = len(full)
+            return {"kind": "token", "text": full[seen:]}
+        if run_type == "tool_use":
+            state = part.get("state")
+            state = state if isinstance(state, dict) else {}
+            status = state.get("status")
+            if not isinstance(status, str) or self._emitted_tool_status.get(part_id) == status:
+                return None
+            self._emitted_tool_status[part_id] = status
+            event: dict[str, Any] = {
+                "kind": "tool",
+                "id": part_id,
+                "name": part.get("tool", "?"),
+                "status": status,
+            }
+            if state.get("input") is not None:
+                event["input"] = state["input"]
+            if state.get("output") is not None:
+                event["output"] = state["output"]
+            return event
+        return None
 
 
 async def _session_total_cost(
@@ -274,14 +357,17 @@ async def run_session(
     timeout: float,
     max_budget_usd: float | None = None,
     max_turns: int | None = None,
+    event_sink: EventSink | None = None,
 ) -> DriverResult:
     """Run one prompt as a serve session and return the mapped result.
 
     Spend and steps are tracked live off the daemon's shared event stream, via a watcher registered
-    for this session; crossing the budget or turn cap aborts the session. Failures before the prompt
-    is sent (caps unenforceable, session create) raise SessionStartError for the runner to retry;
-    once the prompt is in flight, a timeout returns a timed-out result and a transport failure an
-    error result — never a raise, so a charged run is not silently re-run.
+    for this session; crossing the budget or turn cap aborts the session. When ``event_sink`` is
+    given it receives live text deltas and tool-call transitions as they arrive, for streaming a
+    run's progress. Failures before the prompt is sent (caps unenforceable, session create) raise
+    SessionStartError for the runner to retry; once the prompt is in flight, a timeout returns a
+    timed-out result and a transport failure an error result — never a raise, so a charged run is
+    not silently re-run.
     """
     base_url = server.base_url
     client = server.client
@@ -305,7 +391,7 @@ async def run_session(
 
         # Register before sending the prompt (events for a session only start once the prompt runs),
         # so the shared consumer routes this session's events to the watcher without a gap.
-        watcher = _SessionWatcher(session_id, max_budget_usd, max_turns)
+        watcher = _SessionWatcher(session_id, max_budget_usd, max_turns, event_sink=event_sink)
         server.add_watcher(session_id, watcher)
 
         body = build_message_body(

@@ -103,11 +103,15 @@ def _result_payload(result: OpencodeResult) -> dict:
 
 
 async def run_events(request: RunRequest, settings: PodSettings) -> AsyncGenerator[str, None]:
-    """Stream one run as SSE: keep-alive comments while it works, then a ``cost`` and a ``done`` event.
+    """Stream one run as SSE: live ``token``/``tool`` events as the agent works, keep-alive comments
+    while it is idle, then a ``cost`` and a ``done`` event.
 
-    The final ``done`` event carries the OpencodeResult JSON — the response contract. The run's
-    daemon and its ephemeral workspace are always reaped, via a detached cleanup task spawned in the
-    finally, so a client disconnect mid-run can't leak either (see ``_spawn_cleanup``).
+    A ``token`` event carries an assistant-text delta and a ``tool`` event a tool-call transition
+    (its name, status, input, and — once finished — output), so a caller sees a live step trace, not
+    just a terminal answer. The final ``done`` event carries the OpencodeResult JSON — the response
+    contract. The run's daemon and its ephemeral workspace are always reaped, via a detached cleanup
+    task spawned in the finally, so a client disconnect mid-run can't leak either (see
+    ``_spawn_cleanup``).
     """
     try:
         cwd = await stage_workspace(request.workspace)
@@ -119,19 +123,30 @@ async def run_events(request: RunRequest, settings: PodSettings) -> AsyncGenerat
         return
 
     runner = build_runner(request, settings)
+    # The engine pushes live updates onto this queue from the daemon's event loop; the generator
+    # drains it here and forwards each as an SSE event. Unbounded: volume is one event per text delta
+    # or tool-status change, not per republished snapshot, so it tracks real progress, not the firehose.
+    live_events: asyncio.Queue[dict] = asyncio.Queue()
     task = asyncio.create_task(
         runner.run(
             system_prompt=request.system_prompt,
             user_message=request.prompt,
             cwd=cwd,
+            event_sink=live_events.put_nowait,
         )
     )
     try:
-        while True:
-            finished, _ = await asyncio.wait({task}, timeout=settings.keepalive_seconds)
-            if finished:
-                break
-            yield _sse_comment("keep-alive")
+        # Drain live events until the run is done and none are left buffered. A gap longer than the
+        # keep-alive window emits a comment so the connection and any intermediary stay warm.
+        while not task.done() or not live_events.empty():
+            try:
+                event = await asyncio.wait_for(
+                    live_events.get(), timeout=settings.keepalive_seconds
+                )
+            except TimeoutError:
+                yield _sse_comment("keep-alive")
+                continue
+            yield _sse(event.pop("kind"), event)
         result = task.result()
     finally:
         _spawn_cleanup(cwd, task)

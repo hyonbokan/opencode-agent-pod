@@ -175,6 +175,46 @@ async def test_run_events_flattens_structured_output_to_plain_json(monkeypatch, 
 
 
 @pytest.mark.asyncio
+async def test_run_events_streams_live_token_and_tool_events(monkeypatch, stops):
+    # The runner receives an event_sink; the engine would call it with live updates. Simulate that:
+    # the fake run pushes a token and a tool event through the sink, and they must reach the SSE
+    # stream as `token`/`tool` events, in order, before the terminal `cost`/`done`.
+    class _StreamingRunner(_FakeRunner):
+        async def run(self, **kwargs):
+            self.run_kwargs = kwargs
+            sink = kwargs["event_sink"]
+            sink({"kind": "token", "text": "Analyz"})
+            sink({"kind": "token", "text": "ing…"})
+            sink(
+                {
+                    "kind": "tool",
+                    "id": "b1",
+                    "name": "bash",
+                    "status": "running",
+                    "input": {"cmd": "ls"},
+                }
+            )
+            sink(
+                {"kind": "tool", "id": "b1", "name": "bash", "status": "completed", "output": "ok"}
+            )
+            return self.result
+
+    monkeypatch.setattr(service, "OpencodeRunner", _StreamingRunner)
+    req = RunRequest(model="m", prompt="p", tools=["Bash"])
+
+    body = "".join([chunk async for chunk in service.run_events(req, _settings())])
+    events = _events(body)
+
+    assert [e for e, _ in events] == ["token", "token", "tool", "tool", "cost", "done"]
+    payloads = [d for _, d in events]
+    assert payloads[0] == {"text": "Analyz"}
+    assert payloads[2] == {"id": "b1", "name": "bash", "status": "running", "input": {"cmd": "ls"}}
+    assert payloads[3] == {"id": "b1", "name": "bash", "status": "completed", "output": "ok"}
+    assert payloads[-1]["text"] == "answer"  # done still carries the result
+    await service.drain_cleanups()
+
+
+@pytest.mark.asyncio
 async def test_run_events_emits_keepalive_while_the_run_is_in_flight(monkeypatch, stops):
     class _SlowRunner(_FakeRunner):
         async def run(self, **kwargs):
