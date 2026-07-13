@@ -4,7 +4,7 @@
 FROM python:3.12-slim
 
 # Pinned opencode version. Bump deliberately, then re-verify a real run before shipping.
-ARG OPENCODE_VERSION=1.17.11
+ARG OPENCODE_VERSION=1.17.18
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \

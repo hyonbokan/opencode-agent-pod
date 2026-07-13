@@ -6,7 +6,7 @@ pod process cannot enforce itself.
 ## Build & run the image
 
 The `Dockerfile` bundles the FastAPI/SSE service with a pinned `opencode` binary (`OPENCODE_VERSION`,
-default 1.17.11) and the Node runtime opencode needs.
+default 1.17.18) and the Node runtime opencode needs.
 
 ```bash
 # Build (add --platform linux/amd64 when the target host is x86).

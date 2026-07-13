@@ -2,7 +2,7 @@
 
 Autonomous [opencode](https://opencode.ai) agents as a deployable HTTP service.
 
-![opencode](https://img.shields.io/badge/opencode-1.17.11-black?style=flat-square)
+![opencode](https://img.shields.io/badge/opencode-1.17.18-black?style=flat-square)
 ![Python](https://img.shields.io/badge/Python-3.12-blue?style=flat-square)
 ![FastAPI](https://img.shields.io/badge/FastAPI-SSE-009688?style=flat-square)
 
