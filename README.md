@@ -1,10 +1,14 @@
-# opencode-agent-pod
+# OpenCode Agent Pod
 
-A small, deployable container that runs **one fully autonomous [opencode](https://opencode.ai) agent
-per request** behind an HTTP + SSE API. A calling service POSTs a task — a prompt, a workspace
-pointer, a tool allow-list, an optional output schema — and gets back the agent's live
-reasoning/tool trace and a final result. The pod bundles the opencode runtime, the daemon lifecycle,
-a code-executing sandbox, and the provider keys, so the caller embeds none of that.
+Autonomous [opencode](https://opencode.ai) agents as a deployable HTTP service.
+
+![opencode](https://img.shields.io/badge/opencode-1.17.11-black?style=flat-square)
+![Python](https://img.shields.io/badge/Python-3.12-blue?style=flat-square)
+![FastAPI](https://img.shields.io/badge/FastAPI-SSE-009688?style=flat-square)
+
+One request → one fully autonomous agent run → streamed trace + final result. The pod
+bundles the opencode runtime, daemon lifecycle, sandbox, and provider keys so callers
+embed none of that.
 
 ```
 (prompt, workspace, tools, model, schema, budget)  →  streamed events  →  final result
@@ -12,58 +16,46 @@ a code-executing sandbox, and the provider keys, so the caller embeds none of th
 
 ## Why this exists
 
-CLI coding agents like opencode and Claude Code are remarkably capable — native tools (`Read`,
-`Write`, `Edit`, `Bash`, `Glob`, `Grep`) plus MCP, a real multi-turn tool loop, structured output.
-But they are built to be **driven by a human at a terminal**, one approved step at a time.
+CLI agents like opencode and Claude Code are capable — native tools (`Read`, `Write`,
+`Edit`, `Bash`, `Glob`, `Grep`), MCP, multi-turn loops, structured output — but built for
+a human at a terminal.
 
-This pod makes that same capability **programmable and fully autonomous**. POST a task and the agent
-runs a complete loop on its own — plan, run code, read the output, correct itself — streaming the
-trace back and returning a result. What ships is the runtime an autonomous agent actually needs —
-daemon lifecycle, per-request sandbox, key custody — not just an HTTP route over a binary, so a
-caller embeds none of it. And because the toolset is general, it reaches well beyond coding: the same
-service drives BGP routing analysis and customs-document review (see [Who uses it](#who-uses-it)).
+This pod makes that capability **programmable**. POST a task; the agent plans, runs code,
+reads output, and self-corrects on its own, streaming the trace back. Same toolset drives
+coding *and* non-coding work (see [Who uses it](#who-uses-it)).
 
-- **Autonomous, not interactive** — one request is one self-contained run that loops as many turns as
-  it needs, streaming its reason → execute → observe trace.
-- **General-purpose** — the pod knows nothing domain-specific; give it a prompt, tools, and staged
-  data and it does the task, coding or not.
-- **Native tools + MCP, sandboxed** — real `Bash`/`Read`/`Write` and any MCP servers you register, run
-  against a per-request throwaway workspace, not your host.
-- **Keys never cross the boundary** — provider keys stay inside the pod; callers send prompts and get
-  results, never a key (see [Security](#security)).
+- **Autonomous** — one request is one self-contained run; no step-by-step approval.
+- **Domain-free** — give it a prompt, tools, and staged data; the pod knows nothing about BGP or customs.
+- **Sandboxed** — real tools + MCP against a per-request throwaway workspace.
+- **Keys stay inside** — callers send prompts and get results, never a provider key.
 
 ## The core idea: a stateless compute primitive
 
-The pod is closer to a serverless function than to a stateful service. Every request is
-self-contained; any pod can serve any request; a pod crashing loses nothing recoverable. There is
-**no session table, no workspace cache, no conversation history** in the pod. Everything stateful and
-domain-specific lives one layer up, in the caller.
+Closer to a serverless function than a stateful service. Every request is self-contained;
+any pod can serve any request; a crash loses nothing recoverable. **No session table, no
+workspace cache, no conversation history** in the pod — all of that lives in the caller.
 
-| The pod owns (stateless compute)            | The caller owns (state + domain)                  |
-| ------------------------------------------- | ------------------------------------------------- |
-| opencode binary + daemon lifecycle          | Caching / provisioning the workspace              |
-| The agent loop: run → stream → result       | Conversation history / prior findings             |
-| Per-request **ephemeral** workspace + reap  | Domain logic (which prompt / tools / schema)      |
-| Sandbox, permissions, egress for the run    | Building the workspace contents                   |
-| **Provider keys** (the custody boundary)    | End-user identity / auth                          |
+| The pod owns (stateless compute)   | The caller owns (state + domain)             |
+| ---------------------------------- | -------------------------------------------- |
+| opencode binary + daemon lifecycle | Caching / provisioning the workspace         |
+| Agent loop: run → stream → result  | Conversation history / prior findings        |
+| Ephemeral workspace + reap         | Domain logic (prompt / tools / schema)       |
+| Sandbox, permissions, egress       | Building the workspace contents              |
+| Provider keys (custody boundary)   | End-user identity / auth                     |
 
-**Multi-turn without sessions.** Continuity works the way the OpenAI/Anthropic chat APIs do — the
-caller carries state forward. The workspace is carried as a *reference* (never re-uploaded); the
-conversation is carried as **distilled prior findings** (the previous run's structured output or a
-compact summary), not the raw transcript. Structured output is the natural memory unit: each run
-concludes with a clean object; the next run's prompt gets `prior findings: {…}`.
+**Multi-turn without sessions.** Continuity works like the chat APIs: the caller carries
+state forward. Pass the workspace as a *reference*; pass conversation as distilled prior
+findings (structured output or a compact summary), not the raw transcript.
 
-**Workspace by reference.** `workspace` is a *pointer* to where the caller already put the run's
-data, not the bytes themselves:
+**Workspace by reference.** `workspace` is a pointer to data the caller already staged —
+never the bytes themselves:
 
 ```json
 "workspace": { "source": "file:///data/run-42", "mode": "ro" }
 ```
 
-The caller stages the files (BGP dumps, documents, a repo) and passes the location; the pod copies it
-into a throwaway working directory, runs the agent there, and deletes it when the run ends — reading
-fresh each time, owning nothing after. (v1 stages `file://` and local paths; `s3://` is the extension
-point.)
+The pod copies it into a throwaway directory, runs the agent, and deletes it when the run
+ends. (v1: `file://` and local paths; `s3://` is the extension point.)
 
 ## Architecture
 
@@ -74,7 +66,7 @@ flowchart TB
         C1["build prompt / schema<br/>stage workspace<br/>thread prior findings"]
     end
 
-    subgraph pod["opencode-agent-pod (stateless compute)"]
+    subgraph pod["Agent Pod (stateless compute)"]
         API["FastAPI + SSE<br/>POST /agent/run · bearer auth"]
         RUN["OpencodeRunner<br/>budget · turn · timeout caps"]
         WS["ephemeral workspace<br/>stage → run → reap"]
@@ -97,11 +89,10 @@ flowchart TB
     API -- "SSE: token · tool · cost · done" --> C1
 ```
 
-Per request the pod starts a **dedicated daemon** bound to that run's ephemeral workspace, so one
-caller's `Bash`/`Read` can never reach another's files, and reaps both the daemon and the workspace
-when the run ends (even on client disconnect). The model call leaves the daemon carrying a *dummy*
-key and is routed through the in-process proxy, which injects the real key on egress — so no provider
-key ever enters the shell the agent can run.
+Each request gets a **dedicated daemon** on an ephemeral workspace — one caller's tools
+cannot reach another's files. Both are reaped when the run ends (including on client
+disconnect). Model calls leave the daemon with a *dummy* key and route through an
+in-process proxy that injects the real key on egress.
 
 ### One run, end to end
 
@@ -147,28 +138,28 @@ sequenceDiagram
 
 Responds `200 text/event-stream`:
 
-| event         | payload                                                                    |
-| ------------- | -------------------------------------------------------------------------- |
-| `token`       | an assistant-text delta                                                    |
-| `tool`        | a tool call's `name` / `status` / `input`, and `output` once it finishes   |
-| `: keep-alive`| a comment line while the run is idle, so intermediaries don't time out     |
-| `cost`        | running spend                                                              |
-| `done`        | the terminal `OpencodeResult` (below)                                      |
+| event          | payload                                                                  |
+| -------------- | ------------------------------------------------------------------------ |
+| `token`        | assistant-text delta                                                     |
+| `tool`         | tool call `name` / `status` / `input`, plus `output` when finished       |
+| `: keep-alive` | comment line while idle (keeps intermediaries from timing out)           |
+| `cost`         | running spend                                                            |
+| `done`         | terminal `OpencodeResult` (below)                                        |
 
-The `done` event carries the result contract:
+The `done` event carries:
 
-| field               | meaning                                                                     |
-| ------------------- | --------------------------------------------------------------------------- |
-| `text`              | free-text final answer                                                      |
-| `structured_output` | validated object when a `response_schema` was requested                     |
-| `total_cost_usd`    | aggregate spend for the run                                                 |
-| `duration_ms`       | wall-clock                                                                  |
-| `num_turns`         | internal agent turns taken                                                  |
-| `subtype`           | `success` / `max_turns` / `error_timeout` / `error_max_budget_usd` / `error`|
-| `is_error`          | whether the caller should treat the run as failed                          |
+| field               | meaning                                                                      |
+| ------------------- | ---------------------------------------------------------------------------- |
+| `text`              | free-text final answer                                                       |
+| `structured_output` | validated object when a `response_schema` was requested                      |
+| `total_cost_usd`    | aggregate spend                                                              |
+| `duration_ms`       | wall-clock                                                                   |
+| `num_turns`         | internal agent turns taken                                                   |
+| `subtype`           | `success` / `max_turns` / `error_timeout` / `error_max_budget_usd` / `error` |
+| `is_error`          | whether the caller should treat the run as failed                            |
 
-A tool-less run (no `tools`, no `workspace`) is legal — it degrades to plain inference, though in that
-mode opencode buys little over a direct provider SDK call; the pod's value is the *agentic* path.
+A tool-less run (no `tools`, no `workspace`) is legal — plain inference. The pod's value
+is the *agentic* path.
 
 ### `GET /health`
 
@@ -176,8 +167,8 @@ mode opencode buys little over a direct provider SDK call; the pod's value is th
 
 ## Quick start
 
-Requires the `opencode` binary on `PATH` (the Docker image bundles a pinned version) and a provider
-key. `AGENT_POD_TOKEN` is **required** — the pod fails closed (503) without it.
+Requires the `opencode` binary on `PATH` (the Docker image pins one) and a provider key.
+`AGENT_POD_TOKEN` is **required** — the pod fails closed (503) without it.
 
 ```bash
 # Local (Python 3.12) — auto-loads .env
@@ -204,64 +195,57 @@ curl -N -X POST http://localhost:8080/agent/run \
 
 ## Configuration
 
-All config is `AGENT_POD_*` environment variables (nothing hardcoded):
+All config is `AGENT_POD_*` environment variables:
 
-| Variable                       | Default     | Purpose                                                       |
-| ------------------------------ | ----------- | ------------------------------------------------------------- |
-| `AGENT_POD_TOKEN`              | *(unset)*   | Shared bearer token. **Required** — unset ⇒ every request 503 |
-| `AGENT_POD_MAX_BUDGET_USD`     | *(none)*    | Hard ceiling clamped onto every run's budget                  |
-| `AGENT_POD_DEFAULT_BUDGET_USD` | *(none)*    | Budget used when a request names none                         |
-| `AGENT_POD_SESSION_TIMEOUT`    | `900`       | Per-run wall-clock cap (seconds)                              |
-| `AGENT_POD_MAX_TURNS`          | `30`        | Per-run internal turn cap                                     |
-| `AGENT_POD_KEEPALIVE_SECONDS`  | `15`        | Interval between SSE keep-alive comments                      |
-| `AGENT_POD_HOST` / `_PORT`     | `127.0.0.1` / `8080` | Listener bind                                        |
-| `AGENT_POD_KEY_PROXY`          | `1`         | Key-injecting proxy on/off (leave on; off only for debugging) |
-| `AGENT_POD_KEY_PROXY_HOST`     | `127.0.0.1` | Interface the proxy binds (keep host-local)                   |
+| Variable                       | Default              | Purpose                                                       |
+| ------------------------------ | -------------------- | ------------------------------------------------------------- |
+| `AGENT_POD_TOKEN`              | *(unset)*            | Shared bearer token. **Required** — unset ⇒ every request 503 |
+| `AGENT_POD_MAX_BUDGET_USD`     | *(none)*             | Hard ceiling clamped onto every run's budget                  |
+| `AGENT_POD_DEFAULT_BUDGET_USD` | *(none)*             | Budget used when a request names none                         |
+| `AGENT_POD_SESSION_TIMEOUT`    | `900`                | Per-run wall-clock cap (seconds)                              |
+| `AGENT_POD_MAX_TURNS`          | `30`                 | Per-run internal turn cap                                     |
+| `AGENT_POD_KEEPALIVE_SECONDS`  | `15`                 | Interval between SSE keep-alive comments                      |
+| `AGENT_POD_HOST` / `_PORT`     | `127.0.0.1` / `8080` | Listener bind                                                 |
+| `AGENT_POD_KEY_PROXY`          | `1`                  | Key-injecting proxy on/off (leave on; off only for debugging) |
+| `AGENT_POD_KEY_PROXY_HOST`     | `127.0.0.1`          | Interface the proxy binds (keep host-local)                   |
 
 Plus:
 
-- **Provider keys** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) — pod-internal config, mounted as
-  secrets; consumed by the key proxy, never returned.
-- **`AGENT_CUSTOM_PROVIDERS`** — JSON array registering custom OpenAI-compatible providers (e.g. a
-  local vLLM model): `[{"name":"vllm","base_url":"http://host:8000/v1","models":["llama-bgp"]}]`.
-- **`AGENT_MCP_SERVERS`** — JSON array of `{name, command, tools}` registering MCP servers the agent
-  may call. The pod bakes in none; domain tools are registered here, not in pod code.
+- **Provider keys** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) — mounted as secrets; consumed by
+  the key proxy, never returned.
+- **`AGENT_CUSTOM_PROVIDERS`** — JSON array of custom OpenAI-compatible providers (e.g. vLLM):
+  `[{"name":"vllm","base_url":"http://host:8000/v1","models":["llama-bgp"]}]`.
+- **`AGENT_MCP_SERVERS`** — JSON array of `{name, command, tools}` registering MCP servers. The
+  pod bakes in none; domain tools are registered here.
 
 ## Security
 
-A shared service that runs LLM-authored code against caller-supplied workspaces while holding every
-provider key has a large blast radius. It is designed to start **internal and trusted-network**, not
-public:
+Internal / trusted-network only — not for the public internet. The pod runs LLM-authored
+code and holds provider keys.
 
-- **Bearer-gated**, fails closed when no token is configured.
-- **Per-request budget cap** clamped to a pod ceiling — anyone who can call can spend.
-- **Per-request workspace isolation + guaranteed reap** — a separate daemon per ephemeral workspace,
-  torn down on completion *and* on client disconnect (no leak).
-- **Key custody** — a key-injecting proxy holds the real keys in the pod process; the daemon (and any
-  `Bash` child it spawns) carries only a dummy key, so a script cannot read a provider key.
-- **Bash egress** — removing the key from the shell closes key theft; blocking *workspace-data*
-  exfiltration to arbitrary hosts is a network concern the pod can't honestly enforce from Python. It
-  is delivered as a deploy-time egress allowlist — see [DEPLOY.md](DEPLOY.md).
+| Control       | What it does                                                                                          |
+| ------------- | ----------------------------------------------------------------------------------------------------- |
+| **Auth**      | Bearer token required; fails closed (503) if unset                                                    |
+| **Spend**     | Per-request budget clamped to a pod ceiling                                                           |
+| **Isolation** | Dedicated daemon + ephemeral workspace per request; reaped on completion *and* disconnect             |
+| **Keys**      | Real keys live only in the in-process proxy; the daemon and its `Bash` children see a dummy key only  |
+| **Egress**    | Key theft is closed in-process. Blocking workspace exfiltration to arbitrary hosts needs a deploy-time network allowlist — see [DEPLOY.md](DEPLOY.md) |
 
-Full deployment guidance (image build, egress `NetworkPolicy`, single-tenant-worker scaling) is in
-[DEPLOY.md](DEPLOY.md).
+Image build, egress `NetworkPolicy`, and scaling notes: [DEPLOY.md](DEPLOY.md).
 
 ## Who uses it
 
-The pod is domain-free; these are the motivating consumers, not dependencies:
+The pod is domain-free; these are motivating consumers, not dependencies:
 
-- **BGP-LLaMA** — *strong fit.* A code-executing routing analyst: given "analyze prefix X over
-  timerange Y", the backend stages scoped BGP data as the workspace, the agent writes an analysis
-  script, **runs** it (`Bash`), reads output, self-corrects, and streams the trace to the browser.
-  This is where the sandbox earns its keep.
-- **ai-customs** — an agentic declaration cross-checker. In an eval on 30 real customs documents, the
-  scripted pipeline handled the bulk and escalated the 8 valuation criticals it could flag but not
-  resolve to one `POST /agent/run` each; the agent resolved all 8 (5 extraction artifacts, 3 real
-  under-declarations), independently verified.
+- **[BGP-LLaMA](https://github.com/hyonbokan/BGP-LLaMA-webservice)** — code-executing routing
+  analyst. The backend stages scoped BGP data as the workspace; the agent writes an analysis
+  script, runs it (`Bash`), self-corrects, and streams the trace to the browser.
+- **[ai-customs](https://github.com/hyonbokan/ai-customs)** — agentic declaration cross-checker.
+  On 30 real customs documents, the scripted pipeline escalated 8 valuation criticals to one
+  `POST /agent/run` each; the agent resolved all 8 (5 extraction artifacts, 3 real under-declarations).
 
-A typical integration: the caller renders its own prompt/schema, stages a `file://` workspace, POSTs
-one run per unit of work with the bearer token, relays the pod's `token`/`tool` SSE frames to its own
-UI, and threads the run's structured output forward as prior findings.
+Typical integration: render prompt/schema, stage a `file://` workspace, POST one run per unit of
+work, relay `token`/`tool` SSE to your UI, and thread structured output forward as prior findings.
 
 ## Development
 
@@ -271,19 +255,19 @@ UI, and threads the run's structured output forward as prior findings.
 .venv/bin/python -m mypy .                # types (pragmatic)
 ```
 
-Conventions: Python 3.12, Ruff + mypy (see `pyproject.toml`), env-driven config, and a firm rule that
-the pod stays **domain-free** — no BGP/customs/audit vocabulary in pod code. If a change would teach
-the pod what a "timerange" or a "declaration" is, it belongs in a caller instead.
+Conventions: Python 3.12, Ruff + mypy (see `pyproject.toml`), env-driven config. The pod stays
+**domain-free** — no BGP/customs vocabulary in pod code. If a change would teach the pod what a
+"timerange" or "declaration" is, it belongs in a caller.
 
 ## Layout
 
 ```
 opencode-agent-pod/
-├── agent/              # the engine: OpencodeRunner (one autonomous run), the response contract,
+├── agent/              # engine: OpencodeRunner, response contract,
 │   └── opencode/       #   daemon lifecycle, client, driver, event/budget caps, provider+key map
-├── pod/                # the service — FastAPI + SSE over the engine
+├── pod/                # FastAPI + SSE service over the engine
 │   ├── app.py          #   create_app: bearer auth, POST /agent/run, /health, lifespan drain
-│   ├── service.py      #   budget resolution, runner assembly, the SSE generator, per-run reap
+│   ├── service.py      #   budget resolution, runner assembly, SSE generator, per-run reap
 │   ├── workspace.py    #   stage workspace-by-reference → ephemeral cwd → reap
 │   ├── key_proxy.py    #   key-injecting reverse proxy: real keys never enter the daemon
 │   └── schema.py       #   RunRequest + JSON-Schema response pass-through
