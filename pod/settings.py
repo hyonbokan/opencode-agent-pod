@@ -32,6 +32,17 @@ class PodSettings:
     key_proxy_enabled: bool
     # Interface the proxy binds. 127.0.0.1 keeps it unreachable off-host regardless of the pod's bind.
     key_proxy_host: str
+    # Ceiling on a workspace pulled over the network — bounds both the download and, for an archive,
+    # its expanded size, so a runaway or decompression-bomb source cannot fill the disk.
+    workspace_max_bytes: int
+    # Wall-clock cap on fetching a remote workspace before staging is abandoned.
+    workspace_fetch_timeout: float
+    # Hosts a remote (https) workspace source may point at. Empty = any https host (link-local /
+    # metadata addresses are always refused); set it to pin fetches to known storage hosts.
+    workspace_host_allowlist: tuple[str, ...]
+    # Verify TLS when pulling a remote workspace. On by default. Turn off only to accept a
+    # self-signed certificate from trusted local storage (e.g. a dev MinIO on the same host).
+    workspace_tls_verify: bool
 
 
 def _float_or_none(name: str) -> float | None:
@@ -42,6 +53,11 @@ def _float_or_none(name: str) -> float | None:
 def _bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     return default if raw is None else raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _csv(name: str) -> tuple[str, ...]:
+    raw = os.getenv(name, "")
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
 def load_settings() -> PodSettings:
@@ -57,4 +73,8 @@ def load_settings() -> PodSettings:
         port=int(os.getenv("AGENT_POD_PORT", "8080")),
         key_proxy_enabled=_bool("AGENT_POD_KEY_PROXY", True),
         key_proxy_host=os.getenv("AGENT_POD_KEY_PROXY_HOST", "127.0.0.1"),
+        workspace_max_bytes=int(os.getenv("AGENT_POD_WORKSPACE_MAX_BYTES", str(2 * 1024**3))),
+        workspace_fetch_timeout=float(os.getenv("AGENT_POD_WORKSPACE_FETCH_TIMEOUT", "60")),
+        workspace_host_allowlist=_csv("AGENT_POD_WORKSPACE_HOST_ALLOWLIST"),
+        workspace_tls_verify=_bool("AGENT_POD_WORKSPACE_TLS_VERIFY", True),
     )

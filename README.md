@@ -14,6 +14,11 @@ embed none of that.
 (prompt, workspace, tools, model, schema, budget)  →  streamed events  →  final result
 ```
 
+> **Status: portfolio prototype.** Runs on a dev host, not in production. The architecture is
+> designed for a fully decoupled, isolated deployment; a few pieces (network egress, workspace
+> transport) are kept simple because there's no cluster to enforce them yet. Where ideal and
+> prototype diverge, the docs say so — see [DESIGN → Scope](DESIGN.md#scope-prototype-vs-ideal-deployment).
+
 ## Why this exists
 
 CLI agents like opencode and Claude Code are capable — native tools (`Read`, `Write`,
@@ -54,8 +59,14 @@ never the bytes themselves:
 "workspace": { "source": "file:///data/run-42", "mode": "ro" }
 ```
 
-The pod copies it into a throwaway directory, runs the agent, and deletes it when the run
-ends. (v1: `file://` and local paths; `s3://` is the extension point.)
+The pod copies it into a throwaway directory, runs the agent, and deletes it when the run ends.
+
+> **Prototype vs. ideal.** The `s3://`-style pointer is the ideal — the pod pulls a scoped slice
+> from neutral storage, sharing no filesystem with the caller. Today only local `file://`/bare
+> paths are staged, which assumes caller and pod share a host: a single-host prototype
+> convenience, *not* the decoupled deployment shape (an LLM-with-`Bash` sandbox must never share a
+> disk or network with the backend). See [DESIGN → Scope](DESIGN.md#scope-prototype-vs-ideal-deployment)
+> and [DEPLOY.md](DEPLOY.md).
 
 ## Architecture
 

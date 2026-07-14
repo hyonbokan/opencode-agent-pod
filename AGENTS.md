@@ -10,6 +10,19 @@ Key custody (DESIGN §7) is closed: a key-injecting proxy (`pod/key_proxy.py`) k
 
 New session: read [DESIGN.md](DESIGN.md) (architecture and rationale), then [PLAN.md](PLAN.md) (work log and what is next), then this file, before writing code.
 
+## Prototype scope (ideal vs. kept-simple)
+
+This is a portfolio prototype, not a deployed system. The design targets a fully decoupled,
+isolated deployment. **Workspace transport** now supports a network `https://` pull (a pre-signed
+object-store URL is fetched over the network into the ephemeral cwd, sharing no filesystem with the
+caller — the mode to use across a trust boundary); local `file://` copy remains for single-host
+dev, where it assumes caller and pod share a filesystem. What is still deliberately deferred is
+**egress enforcement** (documented in DEPLOY.md, not applied anywhere) and the backend↔pod network
+namespace — both deployment-shaped, not design-shaped. "Complete isolation" = the `https://`
+transport **plus** applying the egress policy in a real deployment. See the
+"Scope: prototype vs. ideal deployment" section in DESIGN.md for the full table and the security
+rationale — an LLM-with-`Bash` sandbox must never share a filesystem or network with the backend.
+
 ## The core idea in one paragraph
 
 The pod is a stateless compute primitive, not a stateful service. One request is one fully autonomous agent run: `(prompt, workspace, tools, model, schema, budget) → streamed events + a final result`. The agent loops internally with tools (read files, run code, call MCP tools) as many turns as it needs, but the pod holds nothing between requests: no cache, no conversation history, no sessions, no domain knowledge. Everything stateful and domain-specific lives in the calling services. Provider keys live inside the pod and never cross the boundary; callers get results, never credentials.

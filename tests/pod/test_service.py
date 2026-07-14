@@ -26,6 +26,10 @@ _BASE_SETTINGS = PodSettings(
     port=8080,
     key_proxy_enabled=False,
     key_proxy_host="127.0.0.1",
+    workspace_max_bytes=2 * 1024**3,
+    workspace_fetch_timeout=60.0,
+    workspace_host_allowlist=(),
+    workspace_tls_verify=True,
 )
 
 

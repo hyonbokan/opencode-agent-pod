@@ -114,7 +114,7 @@ async def run_events(request: RunRequest, settings: PodSettings) -> AsyncGenerat
     ``_spawn_cleanup``).
     """
     try:
-        cwd = await stage_workspace(request.workspace)
+        cwd = await stage_workspace(request.workspace, settings)
     except WorkspaceError as e:
         logger.warning("workspace staging failed: %s", e)
         result = OpencodeResult(text=str(e), is_error=True, subtype="error")
