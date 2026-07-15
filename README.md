@@ -17,28 +17,28 @@ embed none of that.
 > **Status: portfolio prototype.** Runs on a dev host, not in production. The architecture is
 > designed for a fully decoupled, isolated deployment; a few pieces (network egress, workspace
 > transport) are kept simple because there's no cluster to enforce them yet. Where ideal and
-> prototype diverge, the docs say so — see [DESIGN → Scope](DESIGN.md#scope-prototype-vs-ideal-deployment).
+> prototype diverge, the docs say so; see [DESIGN → Scope](DESIGN.md#scope-prototype-vs-ideal-deployment).
 
 ## Why this exists
 
-CLI agents like opencode and Claude Code are capable — native tools (`Read`, `Write`,
-`Edit`, `Bash`, `Glob`, `Grep`), MCP, multi-turn loops, structured output — but built for
-a human at a terminal.
+CLI agents like opencode and Claude Code are capable: native tools (`Read`, `Write`,
+`Edit`, `Bash`, `Glob`, `Grep`), MCP, multi-turn loops, structured output. But they're
+built for a human at a terminal.
 
-This pod makes that capability **programmable**. POST a task; the agent plans, runs code,
-reads output, and self-corrects on its own, streaming the trace back. Same toolset drives
-coding *and* non-coding work (see [Who uses it](#who-uses-it)).
+This pod makes that capability programmable. POST a task; the agent plans, runs code,
+reads output, and self-corrects on its own, streaming the trace back. The same toolset
+drives coding and non-coding work (see [Who uses it](#who-uses-it)).
 
-- **Autonomous** — one request is one self-contained run; no step-by-step approval.
-- **Domain-free** — give it a prompt, tools, and staged data; the pod knows nothing about BGP or customs.
-- **Sandboxed** — real tools + MCP against a per-request throwaway workspace.
-- **Keys stay inside** — callers send prompts and get results, never a provider key.
+- Autonomous: one request is one self-contained run, no step-by-step approval.
+- Domain-free: give it a prompt, tools, and staged data; the pod knows nothing about BGP or customs.
+- Sandboxed: real tools and MCP against a per-request throwaway workspace.
+- Keys stay inside: callers send prompts and get results, never a provider key.
 
 ## The core idea: a stateless compute primitive
 
 Closer to a serverless function than a stateful service. Every request is self-contained;
-any pod can serve any request; a crash loses nothing recoverable. **No session table, no
-workspace cache, no conversation history** in the pod — all of that lives in the caller.
+any pod can serve any request; a crash loses nothing recoverable. No session table, no
+workspace cache, no conversation history in the pod: all of that lives in the caller.
 
 | The pod owns (stateless compute)   | The caller owns (state + domain)             |
 | ---------------------------------- | -------------------------------------------- |
@@ -48,12 +48,12 @@ workspace cache, no conversation history** in the pod — all of that lives in t
 | Sandbox, permissions, egress       | Building the workspace contents              |
 | Provider keys (custody boundary)   | End-user identity / auth                     |
 
-**Multi-turn without sessions.** Continuity works like the chat APIs: the caller carries
-state forward. Pass the workspace as a *reference*; pass conversation as distilled prior
+Continuity works without sessions, the way the chat APIs do it: the caller carries
+state forward. Pass the workspace as a reference; pass conversation as distilled prior
 findings (structured output or a compact summary), not the raw transcript.
 
-**Workspace by reference.** `workspace` is a pointer to data the caller already staged —
-never the bytes themselves:
+The `workspace` is a pointer to data the caller already staged, never the bytes
+themselves:
 
 ```json
 "workspace": { "source": "file:///data/run-42", "mode": "ro" }
@@ -61,10 +61,10 @@ never the bytes themselves:
 
 The pod copies it into a throwaway directory, runs the agent, and deletes it when the run ends.
 
-> **Prototype vs. ideal.** The `s3://`-style pointer is the ideal — the pod pulls a scoped slice
+> **Prototype vs. ideal.** The `s3://`-style pointer is the ideal: the pod pulls a scoped slice
 > from neutral storage, sharing no filesystem with the caller. Today only local `file://`/bare
-> paths are staged, which assumes caller and pod share a host: a single-host prototype
-> convenience, *not* the decoupled deployment shape (an LLM-with-`Bash` sandbox must never share a
+> paths are staged, which assumes caller and pod share a host, a single-host prototype
+> convenience, not the decoupled deployment shape (an LLM-with-`Bash` sandbox must never share a
 > disk or network with the backend). See [DESIGN → Scope](DESIGN.md#scope-prototype-vs-ideal-deployment)
 > and [DEPLOY.md](DEPLOY.md).
 
@@ -100,9 +100,9 @@ flowchart TB
     API -- "SSE: token · tool · cost · done" --> C1
 ```
 
-Each request gets a **dedicated daemon** on an ephemeral workspace — one caller's tools
+Each request gets a dedicated daemon on an ephemeral workspace; one caller's tools
 cannot reach another's files. Both are reaped when the run ends (including on client
-disconnect). Model calls leave the daemon with a *dummy* key and route through an
+disconnect). Model calls leave the daemon with a dummy key and route through an
 in-process proxy that injects the real key on egress.
 
 ### One run, end to end
@@ -132,7 +132,7 @@ sequenceDiagram
 
 ## API
 
-### `POST /agent/run` — bearer token required
+### `POST /agent/run` (bearer token required)
 
 ```jsonc
 {
@@ -169,8 +169,8 @@ The `done` event carries:
 | `subtype`           | `success` / `max_turns` / `error_timeout` / `error_max_budget_usd` / `error` |
 | `is_error`          | whether the caller should treat the run as failed                            |
 
-A tool-less run (no `tools`, no `workspace`) is legal — plain inference. The pod's value
-is the *agentic* path.
+A tool-less run (no `tools`, no `workspace`) is legal: plain inference. The pod's value
+is the agentic path.
 
 ### `GET /health`
 
@@ -179,10 +179,10 @@ is the *agentic* path.
 ## Quick start
 
 Requires the `opencode` binary on `PATH` (the Docker image pins one) and a provider key.
-`AGENT_POD_TOKEN` is **required** — the pod fails closed (503) without it.
+`AGENT_POD_TOKEN` is required: the pod fails closed (503) without it.
 
 ```bash
-# Local (Python 3.12) — auto-loads .env
+# Local (Python 3.12), auto-loads .env
 cp .env.example .env          # set AGENT_POD_TOKEN + a provider key (e.g. ANTHROPIC_API_KEY)
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m pod       # serves on :8080
@@ -210,7 +210,7 @@ All config is `AGENT_POD_*` environment variables:
 
 | Variable                       | Default              | Purpose                                                       |
 | ------------------------------ | -------------------- | ------------------------------------------------------------- |
-| `AGENT_POD_TOKEN`              | *(unset)*            | Shared bearer token. **Required** — unset ⇒ every request 503 |
+| `AGENT_POD_TOKEN`              | *(unset)*            | Shared bearer token, required. Unset means every request returns 503 |
 | `AGENT_POD_MAX_BUDGET_USD`     | *(none)*             | Hard ceiling clamped onto every run's budget                  |
 | `AGENT_POD_DEFAULT_BUDGET_USD` | *(none)*             | Budget used when a request names none                         |
 | `AGENT_POD_SESSION_TIMEOUT`    | `900`                | Per-run wall-clock cap (seconds)                              |
@@ -222,16 +222,16 @@ All config is `AGENT_POD_*` environment variables:
 
 Plus:
 
-- **Provider keys** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) — mounted as secrets; consumed by
+- Provider keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …): mounted as secrets, consumed by
   the key proxy, never returned.
-- **`AGENT_CUSTOM_PROVIDERS`** — JSON array of custom OpenAI-compatible providers (e.g. vLLM):
+- `AGENT_CUSTOM_PROVIDERS`: JSON array of custom OpenAI-compatible providers (e.g. vLLM):
   `[{"name":"vllm","base_url":"http://host:8000/v1","models":["llama-bgp"]}]`.
-- **`AGENT_MCP_SERVERS`** — JSON array of `{name, command, tools}` registering MCP servers. The
+- `AGENT_MCP_SERVERS`: JSON array of `{name, command, tools}` registering MCP servers. The
   pod bakes in none; domain tools are registered here.
 
 ## Security
 
-Internal / trusted-network only — not for the public internet. The pod runs LLM-authored
+Internal, trusted-network use only; not for the public internet. The pod runs LLM-authored
 code and holds provider keys.
 
 | Control       | What it does                                                                                          |
@@ -240,7 +240,7 @@ code and holds provider keys.
 | **Spend**     | Per-request budget clamped to a pod ceiling                                                           |
 | **Isolation** | Dedicated daemon + ephemeral workspace per request; reaped on completion *and* disconnect             |
 | **Keys**      | Real keys live only in the in-process proxy; the daemon and its `Bash` children see a dummy key only  |
-| **Egress**    | Key theft is closed in-process. Blocking workspace exfiltration to arbitrary hosts needs a deploy-time network allowlist — see [DEPLOY.md](DEPLOY.md) |
+| **Egress**    | Key theft is closed in-process. Blocking workspace exfiltration to arbitrary hosts needs a deploy-time network allowlist; see [DEPLOY.md](DEPLOY.md) |
 
 Image build, egress `NetworkPolicy`, and scaling notes: [DEPLOY.md](DEPLOY.md).
 
@@ -248,10 +248,10 @@ Image build, egress `NetworkPolicy`, and scaling notes: [DEPLOY.md](DEPLOY.md).
 
 The pod is domain-free; these are motivating consumers, not dependencies:
 
-- **[BGP-LLaMA](https://github.com/hyonbokan/BGP-LLaMA-webservice)** — code-executing routing
+- [BGP-LLaMA](https://github.com/hyonbokan/BGP-LLaMA-webservice): code-executing routing
   analyst. The backend stages scoped BGP data as the workspace; the agent writes an analysis
   script, runs it (`Bash`), self-corrects, and streams the trace to the browser.
-- **[ai-customs](https://github.com/hyonbokan/ai-customs)** — agentic declaration cross-checker.
+- [ai-customs](https://github.com/hyonbokan/ai-customs): agentic declaration cross-checker.
   On 30 real customs documents, the scripted pipeline escalated 8 valuation criticals to one
   `POST /agent/run` each; the agent resolved all 8 (5 extraction artifacts, 3 real under-declarations).
 
@@ -267,7 +267,7 @@ work, relay `token`/`tool` SSE to your UI, and thread structured output forward 
 ```
 
 Conventions: Python 3.12, Ruff + mypy (see `pyproject.toml`), env-driven config. The pod stays
-**domain-free** — no BGP/customs vocabulary in pod code. If a change would teach the pod what a
+domain-free: no BGP/customs vocabulary in pod code. If a change would teach the pod what a
 "timerange" or "declaration" is, it belongs in a caller.
 
 ## Layout
