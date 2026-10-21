@@ -28,24 +28,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from agent.logger import logger
-from agent.opencode.providers import CATALOG_KEY_VARS, load_custom_providers
-
-# Catalog provider segment -> its real upstream and how its key is carried on the wire. The upstream
-# includes the API version segment, because the SDK treats it as part of the base URL and appends
-# only the endpoint (e.g. "messages"). Custom providers forward to their declared base_url, which
-# already carries any version segment, with bearer auth.
-_CATALOG_UPSTREAMS: dict[str, str] = {
-    "anthropic": "https://api.anthropic.com/v1",
-    "openai": "https://api.openai.com/v1",
-    "google": "https://generativelanguage.googleapis.com/v1beta",
-    "xai": "https://api.x.ai/v1",
-}
-_CATALOG_AUTH: dict[str, str] = {
-    "anthropic": "anthropic",  # x-api-key header
-    "openai": "bearer",  # Authorization: Bearer
-    "google": "google",  # x-goog-api-key header
-    "xai": "bearer",
-}
+from agent.opencode.providers import CATALOG_PROVIDERS, load_custom_providers
 
 # Hop-by-hop headers not forwarded, plus the auth headers we replace rather than pass through.
 _HOP_BY_HOP = frozenset(
@@ -81,16 +64,16 @@ def build_routes(env: Mapping[str, str]) -> dict[str, ProviderRoute]:
     """Build the routing table: one entry per provider that has a real key, read from the environment.
 
     A catalog provider is included only when a real key for it is present; a custom provider is routed
-    to the base URL it declared. The real key stays here and is never handed to the daemon.
+    with bearer auth to the base URL it declared, which already carries any version segment. The
+    real key stays here and is never handed to the daemon.
     """
     routes: dict[str, ProviderRoute] = {}
-    for seg, key_vars in CATALOG_KEY_VARS.items():
-        key = next((env[v] for v in key_vars if env.get(v)), None)
-        if key:
-            routes[seg] = ProviderRoute(_CATALOG_UPSTREAMS[seg], key, _CATALOG_AUTH[seg])
+    for seg, provider in CATALOG_PROVIDERS.items():
+        key = provider.key(env)
+        if key is not None:
+            routes[seg] = ProviderRoute(provider.upstream, key, provider.auth)
     for p in load_custom_providers(env):
-        key = (env.get(p.api_key_env) if p.api_key_env else None) or p.api_key
-        routes[p.name] = ProviderRoute(p.base_url, key, "bearer")
+        routes[p.name] = ProviderRoute(p.base_url, p.key(env), "bearer")
     return routes
 
 
