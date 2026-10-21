@@ -134,3 +134,33 @@ async def test_shutdown_all_stops_daemons_and_clears_pool():
     assert pool._daemons == {}
     # Safe to call again on an empty pool.
     await pool.shutdown_opencode_daemons()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("clean_pool")
+async def test_recycle_evicts_unresponsive_daemon_so_next_acquire_is_fresh():
+    # A daemon that stops serving stays alive, so the dead-process check never fires and every later
+    # agent on that directory keeps hitting the same one.
+    wedged = await pool.get_opencode_daemon("/a")
+
+    await pool.recycle_opencode_daemon("/a", wedged)
+
+    assert cast(Any, wedged).stopped == 1
+    assert "/a" not in pool._daemons
+    assert await pool.get_opencode_daemon("/a") is not wedged
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("clean_pool")
+async def test_recycle_is_identity_checked_so_concurrent_callers_relaunch_once():
+    # Every agent sharing the wedged daemon asks to recycle it; only the one still holding the pooled
+    # instance may, or a straggler would tear down the replacement the winner just started.
+    wedged = await pool.get_opencode_daemon("/a")
+    await pool.recycle_opencode_daemon("/a", wedged)
+    replacement = await pool.get_opencode_daemon("/a")
+
+    await pool.recycle_opencode_daemon("/a", wedged)  # straggler, holding a stale instance
+
+    assert cast(Any, replacement).stopped == 0
+    assert pool._daemons["/a"] is replacement
+    assert cast(Any, wedged).stopped == 1  # not stopped twice either

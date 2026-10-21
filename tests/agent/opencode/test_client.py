@@ -4,6 +4,7 @@ bodies sent and the result parsing are both asserted without a live server."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import Any, cast
@@ -13,15 +14,21 @@ import pytest
 from pydantic import BaseModel
 
 from agent.errors import SessionStartError
+from agent.opencode import client as client_mod
 from agent.opencode.client import (
+    _CHILD_WRAP_UP_TEXT,
+    _ROOT_WRAP_UP_TEXT,
     _SessionWatcher,
+    _to_driver_result,
     build_message_body,
     mcp_local_config,
     register_mcp,
     run_session,
     to_permission_ruleset,
+    wrap_up_tools,
 )
-from agent.opencode.driver import build_timeline
+from agent.opencode.driver import DriverResult, ParsedRun, SessionEnd, build_timeline
+from agent.opencode.providers import format_schema
 from agent.opencode.server import OpencodeServer
 from agent.permissions import PermissionSpec
 from agent.runner import OpencodeRunner
@@ -70,7 +77,7 @@ def test_build_message_body_carries_model_system_variant_and_format():
     assert body["variant"] == "high"
     assert body["parts"] == [{"type": "text", "text": "find bugs"}]
     assert body["format"]["type"] == "json_schema"
-    assert body["format"]["schema"] == _Findings.model_json_schema()
+    assert body["format"]["schema"] == format_schema(_Findings, "openai")
 
 
 def test_build_message_body_omits_optional_fields_when_absent():
@@ -216,18 +223,25 @@ class _FakeServer:
 
     base_url = "http://d"
 
-    def __init__(self, client, *, events=None, events_ready=True):
+    def __init__(self, client, *, events=None, events_ready=True, responsive=True, actions=None):
         self.client = client
         self.events_ready = events_ready
         self._events = events or []
+        self._actions = actions
         self.removed: list[str] = []
+        self._responsive = responsive
 
     def add_watcher(self, _session_id: str, watcher) -> None:
         for event in self._events:  # simulate the shared consumer streaming this session's events
-            watcher.process(event)
+            action = watcher.process(event)
+            if self._actions is not None:
+                self._actions.append(action)
 
     def remove_watcher(self, session_id: str) -> None:
         self.removed.append(session_id)
+
+    async def is_responsive(self) -> bool:
+        return self._responsive
 
 
 _FINAL = {
@@ -236,7 +250,9 @@ _FINAL = {
 }
 
 
-async def _run(handler, *, events=None, events_ready=True, **overrides):
+async def _run(
+    handler, *, events=None, events_ready=True, responsive=True, actions=None, **overrides
+):
     kwargs: dict[str, Any] = {
         "opencode_model": "openai/gpt-5.4-mini",
         "system_prompt": "sys",
@@ -250,7 +266,9 @@ async def _run(handler, *, events=None, events_ready=True, **overrides):
     }
     kwargs.update(overrides)
     client = _mock_client(handler)
-    server = _FakeServer(client, events=events, events_ready=events_ready)
+    server = _FakeServer(
+        client, events=events, events_ready=events_ready, responsive=responsive, actions=actions
+    )
     try:
         return await run_session(cast(OpencodeServer, server), **kwargs)
     finally:
@@ -297,6 +315,8 @@ async def test_run_session_success_aggregates_from_stream_and_sends_expected_bod
     assert result.parsed.cost_usd == pytest.approx(0.005)
     assert result.parsed.num_turns == 2
     assert result.parsed.text == "done"
+    # The finish reason travels through so the runner can tell a concluded run from a truncated one.
+    assert result.parsed.finish == "tool-calls"
     assert len(result.timeline) == 2  # two messageID-grouped steps rebuilt for the trace
     assert result.returncode == 0
 
@@ -319,7 +339,7 @@ async def test_run_session_reports_budget_exceeded_from_watcher():
     ]
     result = await _run(_serve_handler(_FINAL, seen), events=events, max_budget_usd=0.004)
 
-    assert result.budget_exceeded is True
+    assert result.end is SessionEnd.OVER_BUDGET
     assert result.parsed.cost_usd == pytest.approx(0.005)
 
 
@@ -332,7 +352,39 @@ async def test_run_session_reports_turn_cap_from_watcher():
     ]
     result = await _run(_serve_handler(_FINAL, seen), events=events, max_turns=1)
 
-    assert result.turns_exceeded is True
+    assert result.end is SessionEnd.TURNS_EXHAUSTED
+
+
+@pytest.mark.asyncio
+async def test_run_session_wrap_up_body_repeats_the_original_with_tools_off():
+    seen: dict = {}
+    actions: list = []
+    events = [_step("sess-1", 0.95)]
+    await _run(
+        _serve_handler(_FINAL, seen),
+        events=events,
+        actions=actions,
+        max_budget_usd=1.0,
+        wrap_up=True,
+    )
+
+    ((session_id, body),) = actions[0].prompts
+    assert session_id == "sess-1"
+    assert body["parts"] == [{"type": "text", "text": _ROOT_WRAP_UP_TEXT}]
+    assert body["tools"] == wrap_up_tools()
+    # Everything else matches the original message, so the structured answer stays available.
+    assert {k: v for k, v in body.items() if k not in ("parts", "tools")} == {
+        k: v for k, v in seen["message"].items() if k != "parts"
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_session_sends_no_wrap_up_unless_asked():
+    actions: list = []
+    events = [_step("sess-1", 0.95)]
+    await _run(_serve_handler(_FINAL, {}), events=events, actions=actions, max_budget_usd=1.0)
+
+    assert actions[0].prompts == ()
 
 
 @pytest.mark.asyncio
@@ -350,9 +402,9 @@ async def test_run_session_abort_error_does_not_shadow_cap_classification():
     ]
     result = await _run(_serve_handler(final, seen), events=events, max_turns=1)
 
-    assert result.turns_exceeded is True
+    assert result.end is SessionEnd.TURNS_EXHAUSTED
     assert result.parsed.error is None  # the abort's error is dropped
-    mapped = OpencodeRunner._to_result(result)
+    mapped = OpencodeRunner._to_result(result, expects_structured=False)
     assert mapped.subtype == "max_turns"  # a designed ceiling, not an error
     assert mapped.is_error is False
 
@@ -377,10 +429,13 @@ async def test_run_session_prefers_cap_classification_when_prompt_post_errors():
 
     result = await _run(handler, events=events, max_budget_usd=0.004)
 
-    assert result.budget_exceeded is True
+    assert result.end is SessionEnd.OVER_BUDGET
     assert result.parsed.error is None  # not reclassified as a generic error
     assert result.parsed.cost_usd == pytest.approx(0.005)
-    assert OpencodeRunner._to_result(result).subtype == "error_max_budget_usd"
+    assert (
+        OpencodeRunner._to_result(result, expects_structured=False).subtype
+        == "error_max_budget_usd"
+    )
 
 
 @pytest.mark.asyncio
@@ -397,6 +452,8 @@ async def test_run_session_falls_back_to_final_message_when_stream_is_empty():
     assert result.parsed.cost_usd == pytest.approx(0.0017)
     assert result.parsed.num_turns == 1
     assert result.parsed.structured == {"findings": []}
+    # The final message's own cost covers this run only, so it is safe to add to earlier attempts.
+    assert result.parsed.cost_is_session_total is False
 
 
 @pytest.mark.asyncio
@@ -421,6 +478,9 @@ async def test_run_session_reconciles_cost_from_session_aggregate_when_stream_is
     result = await _run(handler, events=[_idle_event("sess-1")], response_model=None)
 
     assert result.parsed.cost_usd == pytest.approx(0.0091)
+    # Flagged, because on a resumed session that aggregate spans the earlier attempts too and the
+    # runner must not add their cost on top of it.
+    assert result.parsed.cost_is_session_total is True
 
 
 @pytest.mark.asyncio
@@ -431,8 +491,104 @@ async def test_run_session_timeout_is_terminal():
         raise httpx.TimeoutException("read timeout")  # the prompt POST (and best-effort abort)
 
     result = await _run(handler, response_model=None, timeout=1.0)
-    assert result.timed_out is True
+    assert result.end is SessionEnd.TIMED_OUT
     assert result.parsed.structured is None
+
+
+@pytest.mark.asyncio
+async def test_wedged_daemon_is_caught_before_the_full_timeout(monkeypatch):
+    # The daemon accepts the connection but never answers — a hang the prompt POST alone would
+    # only surface once the (here, generously long) session timeout elapses.
+    monkeypatch.setattr(client_mod, "_WEDGE_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(client_mod, "_WEDGE_POLL_MISSES", 1)
+    seen: dict = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session":
+            return httpx.Response(200, json={"id": "sess-1"})
+        if request.url.path.endswith("/abort"):
+            seen["aborted"] = True
+            return httpx.Response(200, json=True)
+        if request.url.path.endswith("/message"):
+            await asyncio.Event().wait()  # never resolves; the watchdog must win the race
+            raise AssertionError("unreachable")
+        if request.method == "DELETE":
+            seen["deleted"] = True
+        return httpx.Response(200, json=True)  # session delete, etc.
+
+    start = time.monotonic()
+    result = await _run(handler, response_model=None, timeout=300.0, responsive=False)
+    elapsed = time.monotonic() - start
+
+    assert result.end is SessionEnd.WEDGED
+    assert "aborted" not in seen  # a proven wedge skips the pointless abort call
+    # The session is what the retry resumes on a fresh daemon, so cleanup must leave it alone.
+    assert "deleted" not in seen
+    assert result.session_id == "sess-1"
+    assert elapsed < 5.0  # nowhere near the 300s session timeout
+    assert result.parsed.structured is None
+
+
+@pytest.mark.asyncio
+async def test_completed_run_is_kept_when_the_health_probe_blips():
+    # The probe only decides runs that did not come back. A reply that arrived is paid for, so a
+    # single missed health check on a busy daemon must not discard it as a wedge and re-run it.
+    events = [
+        _part_event("sess-1", {"type": "text", "text": "done", "messageID": "m1"}),
+        _part_event("sess-1", {"type": "step-finish", "cost": 0.002, "messageID": "m1"}),
+        _idle_event("sess-1"),
+    ]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session":
+            return httpx.Response(200, json={"id": "sess-1"})
+        if request.url.path.endswith("/message"):
+            return httpx.Response(200, json=_FINAL)
+        return httpx.Response(200, json=True)
+
+    result = await _run(handler, events=events, responsive=False)
+
+    assert result.end is SessionEnd.REPLIED
+    assert result.parsed.text == "done"
+
+
+@pytest.mark.asyncio
+async def test_run_session_reports_spend_when_the_daemon_goes_away_mid_prompt():
+    # Recycling a wedged daemon closes the HTTP client every sibling session is posting on. The
+    # spend those siblings already made is real, so it has to come back with the failure.
+    events = [
+        _part_event("sess-1", {"type": "step-start", "messageID": "m1"}),
+        _part_event("sess-1", {"type": "text", "text": "half an answer", "messageID": "m1"}),
+        _part_event("sess-1", {"type": "step-finish", "cost": 0.003, "messageID": "m1"}),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session":
+            return httpx.Response(200, json={"id": "sess-1"})
+        raise RuntimeError("Cannot send a request, as the client has been closed.")
+
+    result = await _run(handler, events=events, response_model=None)
+
+    assert result.parsed.error is not None
+    assert result.parsed.cost_usd == pytest.approx(0.003)
+    assert result.parsed.num_turns == 1
+    assert result.end is SessionEnd.TRANSPORT_LOST
+    assert result.timeline  # the partial work is traceable, not thrown away with the connection
+
+
+@pytest.mark.asyncio
+async def test_daemon_that_went_away_is_not_reported_as_the_agent_failing():
+    lost = DriverResult(
+        parsed=ParsedRun(error="client closed", cost_usd=0.003),
+        returncode=1,
+        duration_ms=1000,
+        end=SessionEnd.TRANSPORT_LOST,
+    )
+    result = OpencodeRunner._to_result(lost, expects_structured=False)
+
+    assert result.subtype == "error_transport"
+    assert result.is_error is True
+    assert result.total_cost_usd == pytest.approx(0.003)
 
 
 @pytest.mark.asyncio
@@ -516,11 +672,11 @@ def _pev(part: dict) -> dict:
 
 def test_session_watcher_accumulates_cost_and_caps_budget():
     w = _SessionWatcher("s", max_budget_usd=0.004, max_turns=None)
-    assert w.process(_pev({"type": "step-finish", "cost": 0.003, "messageID": "m1"})) is False
+    assert not w.process(_pev({"type": "step-finish", "cost": 0.003, "messageID": "m1"})).abort
     assert w.cost == pytest.approx(0.003)
     assert w.turns == 1
     # The second step crosses the budget: it signals an abort and flags the run over-budget.
-    assert w.process(_pev({"type": "step-finish", "cost": 0.002, "messageID": "m2"})) is True
+    assert w.process(_pev({"type": "step-finish", "cost": 0.002, "messageID": "m2"})).abort
     assert w.budget_exceeded is True
     assert w.turns == 2
     assert len(w.part_snapshots) == 2  # both steps captured for the timeline
@@ -528,8 +684,8 @@ def test_session_watcher_accumulates_cost_and_caps_budget():
 
 def test_session_watcher_caps_turns_and_records_idle_and_tools():
     w = _SessionWatcher("s", max_budget_usd=None, max_turns=2)
-    assert w.process(_pev({"type": "step-finish", "cost": 0.0, "messageID": "m1"})) is False
-    assert w.process(_pev({"type": "step-finish", "cost": 0.0, "messageID": "m2"})) is True
+    assert not w.process(_pev({"type": "step-finish", "cost": 0.0, "messageID": "m1"})).abort
+    assert w.process(_pev({"type": "step-finish", "cost": 0.0, "messageID": "m2"})).abort
     assert w.turns_exceeded is True
 
     # A tool part is captured for the timeline but is not a turn; idle sets the completion flag.
@@ -539,6 +695,223 @@ def test_session_watcher_caps_turns_and_records_idle_and_tools():
     assert len(w2.part_snapshots) == 1
     w2.process({"type": "session.idle", "properties": {"sessionID": "s"}})
     assert w2.idle.is_set()
+
+
+def _step(session_id: str, cost: float, reason: str = "tool-calls", message: str = "m") -> dict:
+    part = {"type": "step-finish", "cost": cost, "reason": reason, "messageID": message}
+    return {"type": "message.part.updated", "properties": {"sessionID": session_id, "part": part}}
+
+
+def _answer_call(message: str) -> dict:
+    part = {"type": "tool", "tool": "StructuredOutput", "id": f"t-{message}", "messageID": message}
+    return {"type": "message.part.updated", "properties": {"sessionID": "s", "part": part}}
+
+
+def _user_message(session_id: str, agent: str = "sweeper", variant: str | None = "high") -> dict:
+    model = {"providerID": "xai", "modelID": "grok", **({"variant": variant} if variant else {})}
+    info = {"id": f"u-{session_id}", "role": "user", "agent": agent, "model": model}
+    return {"type": "message.updated", "properties": {"sessionID": session_id, "info": info}}
+
+
+_ROOT_BODY = {"parts": [{"type": "text", "text": _ROOT_WRAP_UP_TEXT}], "tools": wrap_up_tools()}
+
+
+def _wrap_up_watcher(budget: float | None = 1.0, turns: int | None = None) -> _SessionWatcher:
+    return _SessionWatcher("s", budget, turns, _ROOT_BODY)
+
+
+def test_session_watcher_counts_subagent_spend_but_not_its_turns():
+    w = _SessionWatcher("s", max_budget_usd=1.0, max_turns=3)
+    w.process(_step("s", 0.3))
+    assert not w.process(_step("child", 0.5)).abort
+    assert w.cost == pytest.approx(0.8)
+    assert w.subagent_cost == pytest.approx(0.5)  # the trace adds this, as the timeline has none
+    assert w.turns == 1
+    # The subagent's spend alone can cross the budget and abort the run.
+    action = w.process(_step("child", 0.3))
+    assert action.abort and w.budget_exceeded
+    assert w.turns == 1 and not w.turns_exceeded
+
+
+def test_spend_by_subagents_alone_is_reported_from_the_stream():
+    # Subagents can cross the budget before the root's first step finishes; their spend must still
+    # be the run's cost, not the root session's own near-empty aggregate.
+    w = _SessionWatcher("s", max_budget_usd=0.03, max_turns=None)
+    w.process(_step("child", 0.02))
+    w.process(_step("child", 0.015))
+    parsed = _to_driver_result({}, w, duration_ms=1, session_id="s", fallback_cost=None).parsed
+    assert parsed.cost_usd == pytest.approx(0.035)
+    assert parsed.num_turns == 0
+
+
+def test_a_subagent_going_idle_does_not_end_the_run_or_enter_its_timeline():
+    w = _SessionWatcher("s", max_budget_usd=None, max_turns=None)
+    w.process(_user_message("child"))
+    w.process(
+        {
+            "type": "message.part.updated",
+            "properties": {"sessionID": "child", "part": {"type": "text", "text": "x", "id": "p"}},
+        }
+    )
+    w.process(_idle_event("child"))
+
+    assert not w.idle.is_set()
+    assert w.part_snapshots == []
+    w.process(_idle_event("s"))
+    assert w.idle.is_set()
+
+
+def test_wrap_up_fires_once_when_the_budget_is_ninety_percent_spent():
+    w = _wrap_up_watcher(budget=1.0)
+    assert w.process(_step("s", 0.8)).prompts == ()
+
+    action = w.process(_step("s", 0.15))  # 0.95
+    assert not action.abort
+    assert [sid for sid, _ in action.prompts] == ["s"]
+    assert action.prompts[0][1] is _ROOT_BODY
+    assert w.wrap_up_reason == "budget"
+    assert w.cost_at_wrap_up == pytest.approx(0.95)
+
+    assert w.process(_step("s", 0.01)).prompts == ()  # at most one wrap-up
+    assert not w.process(_step("s", 0.03)).abort  # 0.99, still under the budget
+    assert not w.budget_exceeded
+
+
+def test_a_step_that_crosses_the_budget_aborts():
+    w = _wrap_up_watcher(budget=1.0, turns=10)
+    w.process(_step("s", 0.6))
+    action = w.process(_step("child", 0.45))  # 0.6 to 1.05
+    assert action.abort and w.budget_exceeded
+    assert action.prompts == ()
+
+
+def test_spend_well_past_the_budget_still_aborts_after_a_wrap_up():
+    # Covers a session whose wrap-up message never landed and keeps spending.
+    w = _wrap_up_watcher(budget=1.0)
+    assert w.process(_step("s", 0.95)).prompts
+    assert not w.process(_step("s", 0.04)).abort  # 0.99
+    action = w.process(_step("s", 0.02))  # 1.01
+    assert action.abort and w.budget_exceeded
+
+
+def test_a_subagent_can_trigger_the_budget_wrap_up():
+    w = _wrap_up_watcher(budget=1.0)
+    w.process(_step("s", 0.1))
+    assert [sid for sid, _ in w.process(_step("child", 0.85)).prompts] == ["s"]
+    assert w.wrap_up_reason == "budget"
+
+
+def test_wrap_up_fires_four_turns_before_the_turn_cap():
+    w = _wrap_up_watcher(budget=None, turns=10)
+    for _ in range(5):
+        assert w.process(_step("s", 0.0)).prompts == ()
+    assert [sid for sid, _ in w.process(_step("s", 0.0)).prompts] == ["s"]  # 6th of 10
+    assert w.wrap_up_reason == "turns"
+    assert w.process(_step("s", 0.0)).prompts == ()
+    for _ in range(3):
+        w.process(_step("s", 0.0))
+    assert w.turns_exceeded  # still aborts at the cap
+
+
+def test_wrap_up_tells_running_subagents_and_skips_finished_ones():
+    w = _wrap_up_watcher(budget=1.0)
+    for child in ("running", "finished"):
+        w.process(_user_message(child))
+    w.process(_idle_event("finished"))
+
+    action = w.process(_step("s", 0.95))
+
+    assert [sid for sid, _ in action.prompts] == ["s", "running"]
+    assert action.prompts[1][1] == {
+        "agent": "sweeper",
+        "model": {"providerID": "xai", "modelID": "grok"},
+        "variant": "high",
+        "parts": [{"type": "text", "text": _CHILD_WRAP_UP_TEXT}],
+        "tools": wrap_up_tools(),
+    }
+
+
+def test_a_session_whose_step_ended_its_loop_is_not_told():
+    # The step that crosses the threshold is often the session's last; a message then would restart
+    # a session whose result was already taken.
+    w = _wrap_up_watcher(budget=1.0)
+    w.process(_user_message("done-child"))
+    w.process(_user_message("busy-child"))
+    w.process(_step("done-child", 0.0, reason="stop"))
+    w.process(_step("busy-child", 0.1))
+    w.process(_answer_call("m-answer"))
+    action = w.process(_step("s", 0.85, message="m-answer"))
+    assert [sid for sid, _ in action.prompts] == ["busy-child"]
+    # A subagent's final report, crossing it, holds back only that subagent.
+    w2 = _wrap_up_watcher(budget=1.0)
+    w2.process(_user_message("child"))
+    action = w2.process(_step("child", 0.95, reason="stop"))
+    assert [sid for sid, _ in action.prompts] == ["s"]
+
+
+def test_a_held_back_session_that_goes_on_is_told_at_its_next_step():
+    w = _wrap_up_watcher(budget=1.0)
+    w.process(_answer_call("m-answer"))
+    assert w.process(_step("s", 0.9, message="m-answer")).prompts == ()
+    # The answer was rejected, so the root takes another working step.
+    action = w.process(_step("s", 0.01, message="m-next"))
+    assert [sid for sid, _ in action.prompts] == ["s"]
+    assert w.process(_step("s", 0.01, message="m-last")).prompts == ()
+
+
+def test_a_subagent_that_starts_after_the_wrap_up_is_told_once():
+    w = _wrap_up_watcher(budget=1.0)
+    w.process(_step("s", 0.95))
+
+    action = w.process(_user_message("late", variant=None))
+    assert [sid for sid, _ in action.prompts] == ["late"]
+    assert "variant" not in action.prompts[0][1]
+    # Its own wrap-up message comes back as a user message; that must not trigger another.
+    assert w.process(_user_message("late")).prompts == ()
+
+
+@pytest.mark.parametrize("told_before_it_finished", [True, False])
+def test_a_subagent_continued_after_it_finished_is_told_again(told_before_it_finished):
+    w = _wrap_up_watcher(budget=1.0)
+    w.process(_user_message("child"))
+    if told_before_it_finished:
+        assert [sid for sid, _ in w.process(_step("s", 0.95)).prompts] == ["s", "child"]
+    w.process(_idle_event("child"))
+    if not told_before_it_finished:
+        assert [sid for sid, _ in w.process(_step("s", 0.95)).prompts] == ["s"]
+
+    # The task tool continued the finished subagent, so it runs again under the wrap-up.
+    action = w.process(_user_message("child"))
+    assert [sid for sid, _ in action.prompts] == ["child"]
+    assert w.process(_user_message("child")).prompts == ()
+
+
+def test_wrap_up_fires_once_its_time_has_come_even_mid_step():
+    late = _SessionWatcher("s", None, None, _ROOT_BODY, wrap_up_at=time.monotonic() - 1)
+    text = _part_event("s", {"id": "p1", "type": "text", "messageID": "m", "text": "..."})
+    assert [sid for sid, _ in late.process(text).prompts] == ["s"]
+    assert late.wrap_up_reason == "time"
+
+    early = _SessionWatcher("s", None, None, _ROOT_BODY, wrap_up_at=time.monotonic() + 60)
+    assert early.process(_step("s", 0.0)).prompts == ()
+    assert early.wrap_up_reason is None
+
+
+def test_nothing_is_sent_without_a_wrap_up_body():
+    w = _SessionWatcher("s", max_budget_usd=1.0, max_turns=5)
+    w.process(_user_message("child"))
+    assert w.process(_step("s", 0.95)).prompts == ()
+    assert w.wrap_up_reason is None
+    assert w.process(_user_message("late")).prompts == ()
+
+
+def test_wrap_up_tools_switch_off_mcp_and_builtins_but_not_structured_output(monkeypatch):
+    monkeypatch.setenv("AGENT_MCP_SERVERS", _DEMO_SERVERS_JSON)
+    tools = wrap_up_tools()
+    assert {"demo_lookup", "demo_fetch"} <= set(tools)
+    assert {"bash", "read", "task", "grep"} <= set(tools)
+    assert "StructuredOutput" not in tools
+    assert not any(tools.values())
 
 
 def test_session_watcher_dedups_republished_part_snapshots_by_id():
@@ -676,25 +1049,63 @@ def test_session_watcher_swallows_a_raising_sink():
     w.process(
         _pev({"type": "text", "id": "t1", "text": "hi", "messageID": "m1"})
     )  # sink raises here
-    assert w.process(_pev({"type": "step-finish", "cost": 0.005, "messageID": "m1"})) is True
+    assert w.process(_pev({"type": "step-finish", "cost": 0.005, "messageID": "m1"})).abort
     assert w.budget_exceeded is True  # accounting unaffected by the failing sink
+
+
+def test_subagent_parts_never_reach_the_live_sink():
+    # A subagent's text and tool calls are its own work, not the run's answer; streaming them as
+    # tokens would interleave them into the caller's output.
+    events: list[dict] = []
+    w = _SessionWatcher("s", max_budget_usd=None, max_turns=None, event_sink=events.append)
+    child_step = {"type": "step-start", "id": "cs", "messageID": "cm"}
+    child_text = {"type": "text", "id": "ct", "text": "child notes", "messageID": "cm"}
+    for part in (child_step, child_text):
+        w.process(
+            {"type": "message.part.updated", "properties": {"sessionID": "child", "part": part}}
+        )
+    w.process(_pev({"type": "step-start", "id": "s1", "messageID": "m1"}))
+    w.process(_pev({"type": "text", "id": "t1", "text": "answer", "messageID": "m1"}))
+
+    assert events == [{"kind": "token", "text": "answer"}]
 
 
 def test_driver_result_feeds_existing_result_mapping():
     # The serve DriverResult must classify through the same _to_result the run driver uses.
-    from agent.opencode.driver import DriverResult, ParsedRun
-
     success = DriverResult(
-        parsed=ParsedRun(text="ok", structured={"findings": []}, cost_usd=0.02, num_turns=3),
+        parsed=ParsedRun(
+            text="ok", structured={"findings": []}, cost_usd=0.02, num_turns=3, finish="tool-calls"
+        ),
         returncode=0,
         duration_ms=1200,
     )
-    mapped = OpencodeRunner._to_result(success)
+    mapped = OpencodeRunner._to_result(success, expects_structured=True)
     assert mapped.is_error is False
     assert mapped.subtype == "success"
     assert mapped.total_cost_usd == 0.02
     assert mapped.num_turns == 3
     assert mapped.structured_output == {"findings": []}
 
-    timed_out = DriverResult(parsed=ParsedRun(), returncode=None, duration_ms=1000, timed_out=True)
-    assert OpencodeRunner._to_result(timed_out).subtype == "error_timeout"
+    timed_out = DriverResult(
+        parsed=ParsedRun(), returncode=None, duration_ms=1000, end=SessionEnd.TIMED_OUT
+    )
+    assert OpencodeRunner._to_result(timed_out, expects_structured=False).subtype == "error_timeout"
+
+
+@pytest.mark.parametrize(
+    ("error", "provider_failed"),
+    [
+        ({"name": "APIError", "data": {"message": "Overloaded", "statusCode": 529}}, True),
+        ({"name": "ProviderAuthError", "data": {"providerID": "anthropic", "message": "x"}}, True),
+        ({"name": "MessageOutputLengthError", "data": {}}, False),
+        ({"name": "ContextOverflowError", "data": {"message": "too long"}}, False),
+        ("aborted", False),
+        (None, False),
+    ],
+)
+def test_only_a_provider_error_in_the_final_message_flags_the_provider(error, provider_failed):
+    w = _SessionWatcher("s", max_budget_usd=None, max_turns=None)
+    final = {"info": {"error": error}, "parts": []}
+    parsed = _to_driver_result(final, w, duration_ms=1, session_id="s").parsed
+    assert parsed.provider_failed is provider_failed
+    assert (parsed.error is not None) is (error is not None)

@@ -35,6 +35,9 @@ class RunRequest(BaseModel):
     response_schema: dict[str, Any] | None = None
     reasoning_effort: ReasoningEffort | None = None
     max_budget_usd: float | None = None
+    # Near the budget, turn cap, or timeout, ask the agent (and its subagents) to stop using tools
+    # and answer with what it has, instead of being cut off with no answer.
+    wrap_up: bool = False
     workspace: Workspace | None = None
 
 

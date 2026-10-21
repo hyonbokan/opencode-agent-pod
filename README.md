@@ -138,7 +138,8 @@ sequenceDiagram
   "tools":            ["Read", "Bash", "Write"],             // from the tool registry (empty = plain inference)
   "response_schema":  { "…": "JSON Schema" },                // optional → structured output
   "reasoning_effort": "low|medium|high|max",                 // optional
-  "max_budget_usd":   0.50,                                  // hard per-request breaker (clamped to pod ceiling)
+  "max_budget_usd":   0.50,                                  // hard per-request breaker (clamped to pod ceiling); subagent spend counts
+  "wrap_up":          false,                                 // optional; near a cap, switch tools off and ask for an answer
   "workspace":        { "source": "https://…/run-42.tgz", "mode": "ro" } // optional; file:// also ok on a shared host
 }
 ```
@@ -149,6 +150,7 @@ Responds `200 text/event-stream`:
 | -------------- | ------------------------------------------------------------------------ |
 | `token`        | assistant-text delta                                                     |
 | `tool`         | tool call `name` / `status` / `input`, plus `output` when finished       |
+| `retry`        | `reason`: `wedged` (session resumes on a fresh daemon) or `incomplete` (run restarts) |
 | `: keep-alive` | comment line while idle (keeps intermediaries from timing out)           |
 | `cost`         | running spend                                                            |
 | `done`         | terminal `OpencodeResult` (below)                                        |
@@ -159,11 +161,33 @@ The `done` event carries:
 | ------------------- | ---------------------------------------------------------------------------- |
 | `text`              | free-text final answer                                                       |
 | `structured_output` | validated object when a `response_schema` was requested                      |
-| `total_cost_usd`    | aggregate spend                                                              |
+| `total_cost_usd`    | aggregate spend, subagents and retried attempts included                     |
+| `subagent_cost_usd` | the part of `total_cost_usd` spent by subagents                              |
 | `duration_ms`       | wall-clock                                                                   |
-| `num_turns`         | internal agent turns taken                                                   |
-| `subtype`           | `success` / `max_turns` / `error_timeout` / `error_max_budget_usd` / `error` |
+| `num_turns`         | internal agent turns taken (subagent steps not counted)                      |
+| `subtype`           | how the run ended (below)                                                    |
+| `finish`            | the model's final finish reason, as opencode reports it                      |
+| `wrap_up_reason`    | `budget` / `turns` / `time` when `wrap_up` fired, else null                  |
 | `is_error`          | whether the caller should treat the run as failed                            |
+
+`subtype` values:
+
+| subtype                   | meaning                                                                  |
+| ------------------------- | ------------------------------------------------------------------------ |
+| `success`                 | answered                                                                 |
+| `max_turns`               | hit the turn cap; output up to it stands (an error only with no structured answer) |
+| `error_timeout`           | hit the wall-clock cap                                                   |
+| `error_max_budget_usd`    | hit the budget                                                           |
+| `error_incomplete`        | ended without the model concluding (e.g. output-length cut), even after one retry |
+| `error_structured_output` | a `response_schema` run returned no valid object                         |
+| `error_provider`          | the provider failed after opencode's own retries; another model may work |
+| `error_transport`         | the daemon died or wedged mid-run and could not be resumed               |
+| `error_session_start`     | no session could be started                                              |
+| `error`                   | anything else                                                            |
+
+A daemon that stops answering health checks mid-run is detected within about a minute,
+replaced, and the same session is resumed with a continuation nudge (one retry, charged to
+the run's budget).
 
 A run with no `tools` and no `workspace` is plain inference. Add tools and a workspace
 for the agent loop.

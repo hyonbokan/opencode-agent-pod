@@ -14,7 +14,7 @@ from collections.abc import AsyncGenerator
 
 from pydantic import BaseModel
 
-from agent.models import OpencodeResult
+from agent.models import OpencodeResult, RunSubtype
 from agent.opencode.daemon_pool import stop_opencode_daemon
 from agent.runner import OpencodeRunner
 from core.utils.logger import logger
@@ -82,6 +82,7 @@ def build_runner(request: RunRequest, settings: PodSettings) -> OpencodeRunner:
         session_timeout=settings.session_timeout,
         max_budget_usd=resolve_budget(request.max_budget_usd, settings),
         reasoning_effort=request.reasoning_effort or ReasoningEffort.MEDIUM,
+        wrap_up=request.wrap_up,
     )
 
 
@@ -117,7 +118,7 @@ async def run_events(request: RunRequest, settings: PodSettings) -> AsyncGenerat
         cwd = await stage_workspace(request.workspace, settings)
     except WorkspaceError as e:
         logger.warning("workspace staging failed: %s", e)
-        result = OpencodeResult(text=str(e), is_error=True, subtype="error")
+        result = OpencodeResult(text=str(e), is_error=True, subtype=RunSubtype.ERROR)
         yield _sse("cost", {"total_cost_usd": None, "duration_ms": None})
         yield _sse("done", _result_payload(result))
         return

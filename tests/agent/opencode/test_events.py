@@ -1,6 +1,6 @@
 """Tests for the shared per-daemon event consumer: it decodes the daemon-global /event stream once
 and routes each event to the registered session's watcher, aborting a session when its watcher flags
-a cap crossing. Routing is exercised via _dispatch directly (deterministic); the stream lifecycle is
+a cap crossing or sending it messages. Routing is exercised via _dispatch directly (deterministic); the stream lifecycle is
 exercised with an httpx MockTransport."""
 
 from __future__ import annotations
@@ -11,7 +11,8 @@ import json
 import httpx
 import pytest
 
-from agent.opencode.events import EventConsumer
+from agent.opencode import events
+from agent.opencode.events import NO_ACTION, EventConsumer, WatchAction
 
 
 def _mock_client(handler) -> httpx.AsyncClient:
@@ -27,14 +28,19 @@ def _idle(session_id: str) -> dict:
     return {"type": "session.idle", "properties": {"sessionID": session_id}}
 
 
-class _FakeWatcher:
-    def __init__(self, cross: bool = False) -> None:
-        self.seen: list[dict] = []
-        self._cross = cross
+def _created(session_id: str, parent_id: str | None) -> dict:
+    info = {"id": session_id, "parentID": parent_id}
+    return {"type": "session.created", "properties": {"info": info}}
 
-    def process(self, event: dict) -> bool:
+
+class _FakeWatcher:
+    def __init__(self, action: WatchAction = NO_ACTION) -> None:
+        self.seen: list[dict] = []
+        self._action = action
+
+    def process(self, event: dict) -> WatchAction:
         self.seen.append(event)
-        return self._cross
+        return self._action
 
 
 def _ok(_request: httpx.Request) -> httpx.Response:
@@ -67,7 +73,7 @@ async def test_dispatch_aborts_session_when_watcher_flags_a_cap():
         return httpx.Response(200, json=True)
 
     consumer = EventConsumer("http://d", _mock_client(handler))
-    consumer.add_watcher("sess-a", _FakeWatcher(cross=True))
+    consumer.add_watcher("sess-a", _FakeWatcher(WatchAction(abort=True)))
 
     consumer._dispatch(_data(_idle("sess-a")))  # crossing -> fires an abort task
 
@@ -76,6 +82,95 @@ async def test_dispatch_aborts_session_when_watcher_flags_a_cap():
             break
         await asyncio.sleep(0.01)
     assert "/session/sess-a/abort" in posted
+
+
+@pytest.mark.asyncio
+async def test_dispatch_posts_a_watchers_prompts_to_prompt_async():
+    posted: list[tuple[str, dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(204)
+
+    consumer = EventConsumer("http://d", _mock_client(handler))
+    prompts = (("sess-a", {"parts": ["root"]}), ("child-1", {"parts": ["child"]}))
+    consumer.add_watcher("sess-a", _FakeWatcher(WatchAction(prompts=prompts)))
+
+    consumer._dispatch(_data(_idle("sess-a")))
+    await asyncio.gather(*consumer._action_tasks)
+
+    assert sorted(posted, key=lambda p: p[0]) == [
+        ("/session/child-1/prompt_async", {"parts": ["child"]}),
+        ("/session/sess-a/prompt_async", {"parts": ["root"]}),
+    ]
+    assert not any(path.endswith("/abort") for path, _ in posted)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_prompt_post_is_swallowed_and_logged(monkeypatch):
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    warnings: list[tuple] = []
+    monkeypatch.setattr(events.logger, "warning", lambda *args: warnings.append(args))
+    consumer = EventConsumer("http://d", _mock_client(handler))
+    action = WatchAction(prompts=(("sess-a", {}),))
+    consumer.add_watcher("sess-a", _FakeWatcher(action))
+
+    consumer._dispatch(_data(_idle("sess-a")))
+    await asyncio.gather(*consumer._action_tasks)  # must not raise
+
+    assert len(warnings) == 1 and warnings[0][1] == "sess-a"
+
+
+@pytest.mark.asyncio
+async def test_subagent_events_reach_the_runs_watcher_down_to_grandchildren():
+    consumer = EventConsumer("http://d", _mock_client(_ok))
+    w = _FakeWatcher()
+    consumer.add_watcher("root", w)
+
+    consumer._dispatch(_data(_created("child", "root")))
+    consumer._dispatch(_data(_created("grandchild", "child")))
+    consumer._dispatch(_data(_created("stranger", "unrelated")))
+    for session_id in ("child", "grandchild", "stranger"):
+        consumer._dispatch(_data(_idle(session_id)))
+
+    assert [e["properties"]["sessionID"] for e in w.seen] == ["child", "grandchild"]
+
+
+@pytest.mark.asyncio
+async def test_a_subagent_event_can_abort_the_run_it_belongs_to():
+    posted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.append(request.url.path)
+        return httpx.Response(200, json=True)
+
+    consumer = EventConsumer("http://d", _mock_client(handler))
+    consumer.add_watcher("root", _FakeWatcher(WatchAction(abort=True)))
+    consumer._dispatch(_data(_created("child", "root")))
+
+    consumer._dispatch(_data(_idle("child")))
+    await asyncio.gather(*consumer._action_tasks)
+
+    assert posted == ["/session/root/abort"]  # the root, which cascades, not the child
+
+
+@pytest.mark.asyncio
+async def test_removing_a_watcher_drops_its_subagent_aliases():
+    consumer = EventConsumer("http://d", _mock_client(_ok))
+    w, other = _FakeWatcher(), _FakeWatcher()
+    consumer.add_watcher("root", w)
+    consumer.add_watcher("other", other)
+    consumer._dispatch(_data(_created("child", "root")))
+    consumer._dispatch(_data(_created("other-child", "other")))
+
+    consumer.remove_watcher("root")
+    consumer._dispatch(_data(_idle("child")))
+    consumer._dispatch(_data(_idle("other-child")))
+
+    assert w.seen == []
+    assert [e["properties"]["sessionID"] for e in other.seen] == ["other-child"]
 
 
 @pytest.mark.asyncio

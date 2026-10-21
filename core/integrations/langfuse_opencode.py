@@ -9,6 +9,8 @@ from __future__ import annotations
 from typing import Any
 
 
-def record_opencode_trace(timeline: Any, *, model: str, input_message: str) -> None:
+def record_opencode_trace(
+    timeline: Any, *, model: str, input_message: str, subagent_cost_usd: float = 0.0
+) -> None:
     """Record a run's event timeline to the trace backend. Currently does nothing."""
     return None

@@ -4,8 +4,9 @@ Create a session on the daemon, register a watcher with the daemon's shared even
 one prompt. The prompt response carries the structured output and final text; the watcher, fed the
 session's events by the consumer, carries the per-step cost, tokens, and tool calls, which are summed
 into the run's cost and turns and rebuilt into the trace timeline. Watching live lets a budget or turn
-cap abort the session mid-flight. Permissions, tools, the system prompt, and the structured-output
-schema are all set per session and per request.
+cap abort the session mid-flight, and lets an opted-in run ask every running session to wrap up
+first. Subagents' spend counts toward the run's budget. Permissions, tools, the system prompt, and
+the structured-output schema are all set per session and per request.
 """
 
 from __future__ import annotations
@@ -21,9 +22,16 @@ import httpx
 from pydantic import BaseModel
 
 from agent.errors import SessionStartError
-from agent.opencode.driver import DriverResult, ParsedRun, build_timeline
+from agent.opencode.driver import (
+    DriverResult,
+    ParsedRun,
+    SessionEnd,
+    WrapUpReason,
+    build_timeline,
+)
+from agent.opencode.events import NO_ACTION, WatchAction, session_id_of
 from agent.opencode.permission_config import permission_config
-from agent.opencode.providers import provider_of
+from agent.opencode.providers import format_schema, provider_of
 from agent.opencode.server import OpencodeServer
 from agent.permissions import PermissionSpec
 from core.tools.mcp import McpServer, mcp_tool_ids
@@ -34,6 +42,60 @@ _STRUCTURED_RETRY_COUNT = 2
 
 # Short wait for the trailing step-finish plus idle marker to arrive after the prompt POST returns.
 _IDLE_DRAIN_TIMEOUT = 3.0
+
+# Final-message error names that mean the provider, not the run, failed: an API error opencode
+# already retried, or a rejected key. A context overflow is left out — it is the prompt's size.
+_PROVIDER_ERROR_NAMES = frozenset({"APIError", "ProviderAuthError"})
+
+# How often to probe the daemon's health while a message is in flight, and how many consecutive
+# misses to treat as wedged rather than a transient blip (e.g. the daemon briefly busy on a heavy
+# tool call). A wedge is otherwise invisible until the full session timeout elapses, since the
+# prompt POST blocks silently until the run finishes or that timeout fires.
+_WEDGE_POLL_INTERVAL = 20.0
+_WEDGE_POLL_MISSES = 2
+
+# A wrap-up goes out when this share of the budget is spent, or this many turns or seconds before
+# the turn cap or the session timeout. The step after the message usually still has tools, and a
+# rejected structured answer takes up to two retries, so the margins leave room for both.
+_WRAP_UP_BUDGET_SHARE = 0.9
+_WRAP_UP_TURN_MARGIN = 4
+_WRAP_UP_TIME_MARGIN_S = 180.0
+
+# Sent to a session to make it answer with what it has; tools are switched off by the same message.
+_ROOT_WRAP_UP_TEXT = (
+    "This run has nearly reached its limits on spending, steps or time, so all your tools are now "
+    "switched off. Do not try to call any tool. Submit your final answer now, based on the work you "
+    "have done so far.\n\n"
+    "Reports from any subagents you started are in their task results above. You can no longer "
+    "check them yourself, so rely on what a report backs with specific evidence and leave out "
+    "anything you doubt."
+)
+_CHILD_WRAP_UP_TEXT = (
+    "This task has nearly reached its limits on spending, steps or time, so all your tools are now "
+    "switched off. Do not try to call any tool. Reply now with your final report on the task you "
+    "were given: what you found, the evidence for each point, and whether you verified it or only "
+    "suspect it. Then list what you did not get to check."
+)
+# The tool a structured run answers through. opencode adds it before applying the per-message tools
+# map, so it stays available only because the wrap-up tools map leaves it out. Recheck this list
+# when bumping opencode: a built-in tool missing from it stays on during a wrap-up.
+_ANSWER_TOOL = "StructuredOutput"
+_BUILTIN_TOOLS: tuple[str, ...] = (
+    "question",
+    "bash",
+    "read",
+    "glob",
+    "grep",
+    "list",
+    "edit",
+    "write",
+    "apply_patch",
+    "task",
+    "webfetch",
+    "todowrite",
+    "websearch",
+    "skill",
+)
 
 
 def mcp_local_config(server: McpServer) -> dict[str, Any]:
@@ -119,15 +181,22 @@ def build_message_body(
     if response_model is not None:
         body["format"] = {
             "type": "json_schema",
-            "schema": response_model.model_json_schema(),
+            "schema": format_schema(response_model, provider),
             "retryCount": _STRUCTURED_RETRY_COUNT,
         }
     return body
 
 
+def wrap_up_tools() -> dict[str, bool]:
+    """The per-message tools map that switches off every built-in and registered MCP tool."""
+    return dict.fromkeys((*_BUILTIN_TOOLS, *mcp_tool_ids()), False)
+
+
 # Event stream envelope. The daemon-global SSE stream carries one JSON object per ``data:`` line; a
-# part update wraps a step/tool/text part, and an idle event marks the run complete.
+# part update wraps a step/tool/text part, a message update carries a message's role, and an idle
+# event marks the run complete.
 _PART_EVENT = "message.part.updated"
+_MESSAGE_EVENT = "message.updated"
 _IDLE_EVENT = "session.idle"
 # serve names part types with hyphens; the timeline uses underscores. A type absent here is dropped.
 _PART_TYPE_MAP: dict[str, str] = {
@@ -145,11 +214,14 @@ EventSink = Callable[[dict[str, Any]], None]
 
 
 class _SessionWatcher:
-    """Track one session's cost, turns, and timeline from the event stream, flagging when a budget or
-    turn cap is crossed.
+    """Track one run's cost, turns, and timeline from the event stream, flagging when a budget or
+    turn cap is crossed and, if given a root wrap-up message, when to ask sessions to wrap up.
+    ``wrap_up_at`` is checked on every event, not only at step ends, since a step can run long.
 
-    Each step-finish adds its cost and one turn; the first crossing flags the run and signals an abort.
-    The watcher stays pure — the caller does the aborting — so the accounting is testable offline.
+    The consumer feeds it the root session's events and its subagents'. Every step-finish adds its
+    cost; only the root's count as turns, since subagents have their own step limit. Only the root's
+    parts enter the timeline and the live sink. The watcher stays pure — it returns what to do and
+    the consumer does it — so the accounting is testable offline.
     """
 
     def __init__(
@@ -157,15 +229,34 @@ class _SessionWatcher:
         session_id: str,
         max_budget_usd: float | None,
         max_turns: int | None,
+        wrap_up_body: dict[str, Any] | None = None,
+        wrap_up_at: float | None = None,
         event_sink: EventSink | None = None,
     ) -> None:
         self.session_id = session_id
         self._budget = max_budget_usd
         self._max_turns = max_turns
+        self._wrap_up = wrap_up_body is not None
+        self._wrap_up_at = wrap_up_at  # a time.monotonic() reading
         self.cost = 0.0
+        self.subagent_cost = 0.0  # what the timeline misses, as it holds root steps only
         self.turns = 0
+        # Any step, a subagent's included: proof the stream delivered, even with no root turn yet.
+        self.saw_steps = False
         self.budget_exceeded = False
         self.turns_exceeded = False
+        self.wrap_up_reason: WrapUpReason | None = None
+        self.cost_at_wrap_up = 0.0
+        # Wrap-up message per session (a subagent's from its first user message), the sessions that
+        # went idle, and those already told. An idle one must not get a message: it would restart its
+        # loop and spend after its result was already taken. A session whose latest step ended its
+        # loop is held back too, since its idle comes only after that step; if it does go on (a
+        # rejected answer), it is told at its next step.
+        self._bodies: dict[str, dict[str, Any]] = {session_id: wrap_up_body} if wrap_up_body else {}
+        self._idle: set[str] = set()
+        self._told: set[str] = set()
+        self._finishing: set[str] = set()
+        self._answer_steps: set[str] = set()  # message ids of steps that called the answer tool
         # Timeline part snapshots keyed by opencode's stable part id, latest kept: opencode re-sends a
         # full snapshot on every update (a bash tool re-emits its whole output per stdout chunk), so
         # keying by id collapses the hundreds of snapshots per part to one. First-seen order is kept.
@@ -188,47 +279,130 @@ class _SessionWatcher:
         """The latest snapshot of each part, in first-seen order, for the timeline."""
         return list(self._parts.values())
 
-    def process(self, event: dict[str, Any]) -> bool:
-        """Fold one event into the running state; return True when the run should be aborted now."""
+    def process(self, event: dict[str, Any]) -> WatchAction:
+        """Fold one event into the running state and say what the consumer should do about it."""
         etype = event.get("type")
+        props = event.get("properties") or {}
+        session_id = session_id_of(event)
+        assert session_id is not None  # EventConsumer drops events without one
+        is_root = session_id == self.session_id
+        if etype == _MESSAGE_EVENT:
+            info = props.get("info") or {}
+            if is_root or info.get("role") != "user":
+                return NO_ACTION
+            return self._see_child(session_id, info)
         if etype == _IDLE_EVENT:
-            self.idle.set()
-            return False
+            self._idle.add(session_id)
+            if is_root:
+                self.idle.set()
+            return NO_ACTION
         if etype != _PART_EVENT:
-            return False
-        part = (event.get("properties") or {}).get("part") or {}
-        run_type = _PART_TYPE_MAP.get(part.get("type", ""))
-        if run_type is not None:
-            part_id = part.get("id")
-            if not isinstance(part_id, str):
-                part_id = f"_anon{self._anon_seq}"
-                self._anon_seq += 1
-            # opencode's step parts carry no timestamp, so stamp arrival time for the trace timeline.
-            self._parts[part_id] = {
-                "type": run_type,
-                "part": part,
-                "timestamp": int(time.time() * 1000),
-            }
-            if run_type in ("step_start", "step_finish"):
-                message_id = part.get("messageID")
-                if isinstance(message_id, str):
-                    self._generating_messages.add(message_id)
-            self._emit_live(part_id, run_type, part)
+            return NO_ACTION
+        part = props.get("part") or {}
+        if is_root:
+            self._record_part(part)
+        is_answer_call = part.get("type") == "tool" and part.get("tool") == _ANSWER_TOOL
+        if is_answer_call and isinstance(part.get("messageID"), str):
+            self._answer_steps.add(part["messageID"])
         if part.get("type") != "step-finish":
-            return False
-        self.turns += 1
+            return self._check_limits()
+        self.saw_steps = True
+        if is_root:
+            self.turns += 1
         cost = part.get("cost")
         if isinstance(cost, (int, float)):
             self.cost += cost
+            if not is_root:
+                self.subagent_cost += cost
+        if part.get("reason") != "tool-calls" or part.get("messageID") in self._answer_steps:
+            self._finishing.add(session_id)
+        else:
+            self._finishing.discard(session_id)
+        return self._check_limits()
+
+    def _record_part(self, part: dict[str, Any]) -> None:
+        part_type = part.get("type")
+        run_type = _PART_TYPE_MAP.get(part_type) if isinstance(part_type, str) else None
+        if run_type is None:
+            return
+        part_id = part.get("id")
+        if not isinstance(part_id, str):
+            part_id = f"_anon{self._anon_seq}"
+            self._anon_seq += 1
+        # opencode's step parts carry no timestamp, so stamp arrival time for the trace timeline.
+        self._parts[part_id] = {
+            "type": run_type,
+            "part": part,
+            "timestamp": int(time.time() * 1000),
+        }
+        if run_type in ("step_start", "step_finish"):
+            message_id = part.get("messageID")
+            if isinstance(message_id, str):
+                self._generating_messages.add(message_id)
+        self._emit_live(part_id, run_type, part)
+
+    def _check_limits(self) -> WatchAction:
         if self.budget_exceeded or self.turns_exceeded:
-            return False
+            return NO_ACTION
         if self._budget is not None and self.cost >= self._budget:
             self.budget_exceeded = True
-            return True
+            return WatchAction(abort=True)
         if self._max_turns is not None and self.turns >= self._max_turns:
             self.turns_exceeded = True
-            return True
-        return False
+            return WatchAction(abort=True)
+        return self._wrap_up_if_due()
+
+    def _wrap_up_if_due(self) -> WatchAction:
+        if not self._wrap_up:
+            return NO_ACTION
+        if self.wrap_up_reason is None:
+            if self._budget is not None and self.cost >= _WRAP_UP_BUDGET_SHARE * self._budget:
+                self.wrap_up_reason = WrapUpReason.BUDGET
+            elif (
+                self._max_turns is not None and self.turns >= self._max_turns - _WRAP_UP_TURN_MARGIN
+            ):
+                self.wrap_up_reason = WrapUpReason.TURNS
+            elif self._wrap_up_at is not None and time.monotonic() >= self._wrap_up_at:
+                self.wrap_up_reason = WrapUpReason.TIME
+            else:
+                return NO_ACTION
+            self.cost_at_wrap_up = self.cost
+            logger.info(
+                "wrap-up due for session %s (%s): spend $%.4f, %d turns, %d subagents running",
+                self.session_id,
+                self.wrap_up_reason,
+                self.cost,
+                self.turns,
+                sum(1 for sid in self._bodies if sid != self.session_id and sid not in self._idle),
+            )
+        return self._wrap_up_prompts()
+
+    def _wrap_up_prompts(self) -> WatchAction:
+        due = [
+            (sid, body)
+            for sid, body in self._bodies.items()
+            if sid not in self._idle and sid not in self._told and sid not in self._finishing
+        ]
+        self._told.update(sid for sid, _ in due)
+        return WatchAction(prompts=tuple(due)) if due else NO_ACTION
+
+    def _see_child(self, child_id: str, info: dict[str, Any]) -> WatchAction:
+        """Record how to address a subagent from its first user message. A user message in one that
+        went idle means the task tool continued it, so it runs again and is owed a fresh wrap-up.
+        Either kind that appears after the wrap-up went out gets its message now. Our own wrap-up
+        never goes to an idle session, so it cannot cause a restart that sends another."""
+        if child_id not in self._bodies:
+            body = _child_wrap_up_body(info)
+            if body is None:
+                return NO_ACTION
+            self._bodies[child_id] = body
+        elif child_id in self._idle:
+            self._idle.discard(child_id)
+            self._told.discard(child_id)
+            self._finishing.discard(child_id)
+        else:
+            return NO_ACTION
+        return NO_ACTION if self.wrap_up_reason is None else self._wrap_up_prompts()
 
     def _emit_live(self, part_id: str, run_type: str, part: dict[str, Any]) -> None:
         """Push a live update — a text delta or a tool-call transition — to the sink, if one is set.
@@ -287,6 +461,37 @@ class _SessionWatcher:
         return None
 
 
+def _child_wrap_up_body(info: dict[str, Any]) -> dict[str, Any] | None:
+    """The wrap-up message for a subagent, addressed like its own user message; None if that
+    message does not say which agent and model it runs."""
+    model = info.get("model") or {}
+    agent, provider, model_id = info.get("agent"), model.get("providerID"), model.get("modelID")
+    if not (isinstance(agent, str) and isinstance(provider, str) and isinstance(model_id, str)):
+        return None
+    body: dict[str, Any] = {
+        "agent": agent,
+        "model": {"providerID": provider, "modelID": model_id},
+        "parts": [{"type": "text", "text": _CHILD_WRAP_UP_TEXT}],
+        "tools": wrap_up_tools(),
+    }
+    if model.get("variant"):
+        body["variant"] = model["variant"]
+    return body
+
+
+async def _wait_for_wedge(server: OpencodeServer) -> None:
+    """Return once the daemon has failed health probes ``_WEDGE_POLL_MISSES`` times in a row."""
+    misses = 0
+    while True:
+        await asyncio.sleep(_WEDGE_POLL_INTERVAL)
+        if await server.is_responsive():
+            misses = 0
+        else:
+            misses += 1
+            if misses >= _WEDGE_POLL_MISSES:
+                return
+
+
 async def _session_total_cost(
     client: httpx.AsyncClient, base_url: str, session_id: str
 ) -> float | None:
@@ -306,6 +511,7 @@ def _to_driver_result(
     final_message: dict[str, Any],
     watcher: _SessionWatcher,
     duration_ms: int,
+    session_id: str,
     fallback_cost: float | None = None,
 ) -> DriverResult:
     """Map the prompt response and the watched stream onto a DriverResult.
@@ -321,25 +527,64 @@ def _to_driver_result(
     # error. That is expected, not a failure, so drop it and let the cap flags classify the result.
     aborted = watcher.budget_exceeded or watcher.turns_exceeded
     error = None if aborted else info.get("error")
-    if watcher.turns:
+    if watcher.saw_steps:
         cost, turns = watcher.cost, watcher.turns
+        session_total = False
     else:
+        session_total = fallback_cost is not None
         cost = fallback_cost if fallback_cost is not None else float(info.get("cost") or 0.0)
         turns = sum(1 for p in parts if p.get("type") == "step-finish")
+    finish = info.get("finish")
     parsed = ParsedRun(
         text=text,
         structured=info.get("structured"),
         cost_usd=cost,
         num_turns=turns,
         error=json.dumps(error)[:500] if error else None,
+        finish=finish if isinstance(finish, str) else None,
+        cost_is_session_total=session_total,
+        provider_failed=isinstance(error, dict) and error.get("name") in _PROVIDER_ERROR_NAMES,
     )
     return DriverResult(
         parsed=parsed,
         returncode=0,
         duration_ms=duration_ms,
-        budget_exceeded=watcher.budget_exceeded,
-        turns_exceeded=watcher.turns_exceeded,
+        end=_session_end(watcher),
         timeline=build_timeline(watcher.part_snapshots),
+        subagent_cost_usd=watcher.subagent_cost,
+        session_id=session_id,
+        wrap_up_reason=watcher.wrap_up_reason,
+    )
+
+
+def _session_end(watcher: _SessionWatcher) -> SessionEnd:
+    """Which cap cut a replying session short — budget first, since it is the one that spends."""
+    if watcher.budget_exceeded:
+        return SessionEnd.OVER_BUDGET
+    if watcher.turns_exceeded:
+        return SessionEnd.TURNS_EXHAUSTED
+    return SessionEnd.REPLIED
+
+
+def _cut_short_result(
+    watcher: _SessionWatcher,
+    duration_ms: int,
+    session_id: str,
+    *,
+    end: SessionEnd,
+    returncode: int | None,
+    error: str | None = None,
+) -> DriverResult:
+    """A session that ended before its reply, reported with the spend and steps it did make."""
+    return DriverResult(
+        parsed=ParsedRun(error=error, cost_usd=watcher.cost, num_turns=watcher.turns),
+        returncode=returncode,
+        duration_ms=duration_ms,
+        end=end,
+        timeline=build_timeline(watcher.part_snapshots),
+        subagent_cost_usd=watcher.subagent_cost,
+        session_id=session_id,
+        wrap_up_reason=watcher.wrap_up_reason,
     )
 
 
@@ -357,42 +602,54 @@ async def run_session(
     timeout: float,
     max_budget_usd: float | None = None,
     max_turns: int | None = None,
+    wrap_up: bool = False,
+    resume_session_id: str | None = None,
     event_sink: EventSink | None = None,
 ) -> DriverResult:
     """Run one prompt as a serve session and return the mapped result.
 
-    Spend and steps are tracked live off the daemon's shared event stream, via a watcher registered
-    for this session; crossing the budget or turn cap aborts the session. When ``event_sink`` is
-    given it receives live text deltas and tool-call transitions as they arrive, for streaming a
-    run's progress. Failures before the prompt is sent (caps unenforceable, session create) raise
-    SessionStartError for the runner to retry; once the prompt is in flight, a timeout returns a
-    timed-out result and a transport failure an error result — never a raise, so a charged run is
-    not silently re-run.
+    Spend (subagents' included) and steps are tracked live off the daemon's shared event stream, via
+    a watcher registered for this session; crossing the budget or turn cap aborts the session. With
+    ``wrap_up``, nearing either cap or the timeout first sends every running session a message that
+    disables its tools and asks for its answer, so the run can still deliver one. When
+    ``event_sink`` is given it receives live text deltas and tool-call transitions as they arrive.
+    Failures before the prompt is sent (caps unenforceable, session create) raise SessionStartError
+    for the runner to retry; once the prompt is in flight, a timeout returns a timed-out or wedged
+    result and a transport failure an error result — never a raise, so a charged run is not
+    silently re-run.
+
+    ``resume_session_id`` sends the prompt into an existing session instead of creating a new one —
+    used to nudge a wedged run's session back to life on a fresh daemon. opencode's session store
+    lives outside the daemon process, so the session (and its permission ruleset) survives a crash;
+    only the daemon serving it needs replacing.
     """
     base_url = server.base_url
     client = server.client
-    ruleset = to_permission_ruleset(spec, tools, cwd)
     t0 = time.monotonic()
+    # Stays None until the session is actually in play, so the cleanup below only ever touches a
+    # session this call genuinely used.
     session_id: str | None = None
+    skip_cleanup = False
     try:
         # Caps are enforced off the shared event stream, so a capped run must not proceed while it is
         # disconnected. It's pre-prompt, so raise for the runner to retry; uncapped runs proceed.
         if (max_budget_usd is not None or max_turns is not None) and not server.events_ready:
             raise SessionStartError("event stream unavailable; cap cannot be enforced")
 
-        try:
-            session = await client.post(f"{base_url}/session", json={"permission": ruleset})
-            session.raise_for_status()
-            session_id = str(session.json()["id"])
-        except (httpx.HTTPError, RuntimeError) as e:
-            # Pre-prompt and idempotent (RuntimeError covers the shared client being closed by a
-            # concurrent daemon eviction): raise so the runner retries against a fresh daemon.
-            raise SessionStartError(f"session create failed: {str(e)[:300]}") from e
-
-        # Register before sending the prompt (events for a session only start once the prompt runs),
-        # so the shared consumer routes this session's events to the watcher without a gap.
-        watcher = _SessionWatcher(session_id, max_budget_usd, max_turns, event_sink=event_sink)
-        server.add_watcher(session_id, watcher)
+        if resume_session_id is not None:
+            session_id = resume_session_id
+        else:
+            ruleset = to_permission_ruleset(spec, tools, cwd)
+            try:
+                session = await client.post(f"{base_url}/session", json={"permission": ruleset})
+                session.raise_for_status()
+                session_id = str(session.json()["id"])
+            except (httpx.HTTPError, RuntimeError) as e:
+                # Pre-prompt and idempotent (RuntimeError covers the shared client being closed by a
+                # concurrent daemon eviction): raise so the runner retries against a fresh daemon.
+                raise SessionStartError(
+                    f"session create failed: {type(e).__name__}: {str(e)[:300]}"
+                ) from e
 
         body = build_message_body(
             opencode_model=opencode_model,
@@ -401,54 +658,124 @@ async def run_session(
             variant=variant,
             response_model=response_model,
         )
+        wrap_up_body = None
+        if wrap_up:
+            # Same model and format as the original, so the structured answer stays available.
+            wrap_up_body = {
+                **build_message_body(
+                    opencode_model=opencode_model,
+                    system_prompt=system_prompt,
+                    user_message=_ROOT_WRAP_UP_TEXT,
+                    variant=variant,
+                    response_model=response_model,
+                ),
+                "tools": wrap_up_tools(),
+            }
+
+        # Register before sending the prompt (events for a session only start once the prompt runs),
+        # so the shared consumer routes this session's events to the watcher without a gap.
+        watcher = _SessionWatcher(
+            session_id,
+            max_budget_usd,
+            max_turns,
+            wrap_up_body,
+            wrap_up_at=t0 + timeout - _WRAP_UP_TIME_MARGIN_S if wrap_up else None,
+            event_sink=event_sink,
+        )
+        server.add_watcher(session_id, watcher)
+
         message_json: dict[str, Any] = {}
+        post_task = asyncio.ensure_future(
+            client.post(f"{base_url}/session/{session_id}/message", json=body, timeout=timeout)
+        )
+        wedge_task = asyncio.ensure_future(_wait_for_wedge(server))
         try:
-            # asyncio.wait_for caps the whole exchange in wall-clock time. httpx's own timeout only
-            # bounds the gap between response bytes, and the prompt POST blocks silently until the run
-            # finishes, so without this a run that keeps the connection alive could outlast the budget.
-            message = await asyncio.wait_for(
-                client.post(f"{base_url}/session/{session_id}/message", json=body, timeout=timeout),
-                timeout,
+            # Race the prompt against both the wall-clock cap (asyncio.wait's own timeout — httpx's
+            # timeout only bounds the gap between response bytes, and the prompt POST blocks silently
+            # until the run finishes) and a health-probe watchdog, so a daemon that stops responding
+            # mid-run is caught within a few poll intervals instead of only once the full timeout fires.
+            done, _ = await asyncio.wait(
+                {post_task, wedge_task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
             )
+
+            # A 2xx reply means the run finished, so it is never discarded as a wedge — but an
+            # exception is not a reply (a read timeout is a wedge symptom).
+            post_ok = (
+                post_task in done
+                and post_task.exception() is None
+                and post_task.result().is_success
+            )
+            wedged = not post_ok and (wedge_task in done or not (await server.is_responsive()))
+            if wedged:
+                # The daemon is gone, so cleaning the session up on it would only time out too.
+                skip_cleanup = True
+                return _cut_short_result(
+                    watcher, _elapsed_ms(t0), session_id, end=SessionEnd.WEDGED, returncode=None
+                )
+
+            timed_out = post_task not in done or isinstance(
+                post_task.exception(), httpx.TimeoutException
+            )
+            if timed_out:
+                # Abort so the daemon stops spending, then report the timeout with the partial cost
+                # and timeline the watcher gathered (an empty result would under-count overruns).
+                with contextlib.suppress(httpx.HTTPError, RuntimeError):
+                    await client.post(f"{base_url}/session/{session_id}/abort", json={})
+                return _cut_short_result(
+                    watcher, _elapsed_ms(t0), session_id, end=SessionEnd.TIMED_OUT, returncode=None
+                )
+            message = post_task.result()
             message.raise_for_status()
             message_json = message.json()
-        except (TimeoutError, httpx.TimeoutException):
-            # Wall-clock cap hit: abort so the daemon stops spending, then report the timeout with the
-            # partial cost and timeline the watcher gathered (an empty result would under-count overruns).
-            with contextlib.suppress(httpx.HTTPError, RuntimeError):
-                await client.post(f"{base_url}/session/{session_id}/abort", json={})
-            return DriverResult(
-                parsed=ParsedRun(cost_usd=watcher.cost, num_turns=watcher.turns),
-                returncode=None,
-                duration_ms=_elapsed_ms(t0),
-                timed_out=True,
-                timeline=build_timeline(watcher.part_snapshots),
-            )
         except (httpx.HTTPError, RuntimeError, ValueError) as e:
             # In flight and possibly already charged, so terminal — never retried into a silent
             # re-run (ValueError covers a reply body that won't decode). But an intentional cap abort
             # can also surface here; if the watcher already classified the run, that stands, so fall
             # through to its result.
             if not (watcher.budget_exceeded or watcher.turns_exceeded):
-                return DriverResult(
-                    parsed=ParsedRun(error=str(e)[:500]), returncode=1, duration_ms=_elapsed_ms(t0)
+                return _cut_short_result(
+                    watcher,
+                    _elapsed_ms(t0),
+                    session_id,
+                    end=SessionEnd.TRANSPORT_LOST,
+                    returncode=1,
+                    error=str(e)[:500],
                 )
+        finally:
+            # Whichever of the two finished first, the other is now stale and must not hold the
+            # message response open.
+            for task in (post_task, wedge_task):
+                if not task.done():
+                    task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
 
         # Let the watcher fold in the final step-finish (and the idle marker) before reading it.
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(watcher.idle.wait(), _IDLE_DRAIN_TIMEOUT)
+        if watcher.wrap_up_reason is not None:
+            logger.info(
+                "session %s ended after a wrap-up: spend $%.4f at wrap-up, $%.4f at the end",
+                session_id,
+                watcher.cost_at_wrap_up,
+                watcher.cost,
+            )
         # No steps seen means the stream delivered nothing, so the live cost sum is empty; read the
         # session's own aggregate instead of the final message's last-step-only cost.
         fallback_cost = None
-        if watcher.turns == 0:
+        if not watcher.saw_steps:
             fallback_cost = await _session_total_cost(client, base_url, session_id)
         return _to_driver_result(
-            message_json, watcher, duration_ms=_elapsed_ms(t0), fallback_cost=fallback_cost
+            message_json,
+            watcher,
+            duration_ms=_elapsed_ms(t0),
+            session_id=session_id,
+            fallback_cost=fallback_cost,
         )
     finally:
         # Deregister the watcher and delete the session so a long run's shared daemon doesn't
         # accumulate either. Best-effort: a failure here must never mask the run's result.
-        if session_id is not None:
+        if session_id is not None and not skip_cleanup:
             server.remove_watcher(session_id)
             with contextlib.suppress(Exception):
                 await client.delete(f"{base_url}/session/{session_id}")

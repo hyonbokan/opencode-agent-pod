@@ -6,12 +6,14 @@ from __future__ import annotations
 import json
 
 import pytest
+from pydantic import BaseModel
 
 from agent.opencode.providers import (
     DUMMY_PROXY_KEY,
     CustomProvider,
     build_daemon_env,
     build_provider_config,
+    format_schema,
     load_custom_providers,
     provider_of,
     to_opencode_model,
@@ -216,3 +218,80 @@ def test_build_daemon_env_routes_custom_providers_through_the_proxy_too():
     assert entry["options"]["baseURL"] == "http://127.0.0.1:9/vllm"  # proxy, not the real base_url
     assert entry["options"]["apiKey"] == DUMMY_PROXY_KEY
     assert "secret-vllm" not in json.dumps(entry)
+
+
+@pytest.mark.parametrize("effort", [ReasoningEffort.HIGH, ReasoningEffort.MAX])
+def test_variant_anthropic_structured_output_drops_thinking(effort):
+    # Structured output forces a tool call, which Anthropic forbids with thinking on — no variant.
+    model = "anthropic/claude-sonnet-4-6"
+    assert to_opencode_variant(effort, model, structured_output=True) is None
+    assert to_opencode_variant(effort, model) is not None
+
+
+def _objects(schema: dict) -> list[dict]:
+    """Every closed object in a JSON schema, root and nested."""
+    found: list[dict] = []
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            if isinstance(node.get("properties"), dict):
+                found.append(node)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(schema)
+    return found
+
+
+class _Item(BaseModel):
+    name: str
+
+
+class _Group(BaseModel):
+    name: str
+    items: list[_Item]
+
+
+class _Detail(BaseModel):
+    groups: list[_Group]
+
+
+def test_every_nested_object_is_closed_for_strict_decoding():
+    # Strict decoding is only in force if every object refuses extra keys; pydantic emits none, and
+    # a schema the provider judges non-conformant is enforced best-effort, which reads as the model
+    # intermittently skipping the tool call.
+    objects = _objects(format_schema(_Detail, "openai"))
+    assert len(objects) == 3  # root + $defs entry per nested model
+    assert all(o["additionalProperties"] is False for o in objects)
+
+
+def test_gemini_schema_is_inlined_and_left_open():
+    # opencode's Gemini converter drops a $ref inside array items and has no additionalProperties.
+    schema = format_schema(_Detail, "google")
+    assert "$defs" not in schema
+    assert "$ref" not in json.dumps(schema)
+    item = schema["properties"]["groups"]["items"]["properties"]["items"]["items"]
+    assert item["properties"]["name"]["type"] == "string"
+    assert all("additionalProperties" not in o for o in _objects(schema))
+
+
+def test_an_open_map_field_is_not_closed():
+    class WithMap(BaseModel):
+        labels: dict[str, str]
+
+    schema = format_schema(WithMap, "openai")
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["labels"]["additionalProperties"] == {"type": "string"}
+
+
+def test_format_schema_leaves_a_pass_through_schema_untouched():
+    # A request's schema is handed back by reference on every call, so closing it in place would
+    # leak into the caller's own object.
+    from pod.schema import response_model_from_schema
+
+    raw = {"type": "object", "properties": {"a": {"type": "string"}}}
+    format_schema(response_model_from_schema(raw), "openai")
+    assert "additionalProperties" not in raw

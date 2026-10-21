@@ -64,6 +64,19 @@ async def get_opencode_daemon(cwd: str) -> OpencodeServer:
         return daemon
 
 
+async def recycle_opencode_daemon(cwd: str, daemon: OpencodeServer) -> None:
+    """Evict and stop a daemon that stopped serving, so the next acquisition launches a fresh one."""
+    async with _lock:
+        # Identity-checked: concurrent callers hitting the same wedge relaunch it once, not each.
+        if _daemons.get(cwd) is not daemon:
+            return
+        del _daemons[cwd]
+    with contextlib.suppress(Exception):
+        await daemon.stop()
+    # Loud on purpose: recovering silently would hide how often the engine stops serving.
+    logger.warning("opencode serve daemon for %s stopped responding; recycled", cwd)
+
+
 async def stop_opencode_daemon(cwd: str) -> None:
     """Stop and evict the daemon for one working directory, if pooled. Safe when none is pooled.
 

@@ -58,8 +58,16 @@ _TOOL_TO_PERMISSION: dict[str, str] = {
 
 # Built-in tools denied when the allow-list omits them, derived from the map above so a new row can't
 # leave a gap. MCP tools aren't here — they have no permission key and are gated by server
-# registration plus the MCP-tool denies added to the session ruleset.
-_GATED_PERMISSIONS: tuple[str, ...] = tuple(dict.fromkeys(_TOOL_TO_PERMISSION.values()))
+# registration plus the MCP-tool denies added to the session ruleset. `skill` and `question` have
+# no caller-facing tool name but opencode exposes both by default, and neither is safe in a headless
+# run: skill auto-loads external instructions the agent spends its turns on, and question blocks the
+# run waiting for an answer no one gives until the session wall. Both are gated so they are always
+# denied.
+_GATED_PERMISSIONS: tuple[str, ...] = (
+    *dict.fromkeys(_TOOL_TO_PERMISSION.values()),
+    "skill",
+    "question",
+)
 
 
 def _allowed_permission_keys(tools: list[str]) -> set[str]:
