@@ -297,7 +297,7 @@ what a "timerange" or "declaration" is, it belongs in a caller.
 ```
 opencode-agent-pod/
 ├── agent/              # engine: OpencodeRunner, response contract, MCP registry
-│   └── opencode/       #   daemon lifecycle, client, driver, event/budget caps, provider+key map
+│   └── opencode/       #   session client, watcher (caps, wrap-up), daemon lifecycle, provider+key map
 ├── pod/                # FastAPI + SSE service over the engine
 │   ├── app.py          #   create_app: bearer auth, POST /agent/run, /health, lifespan drain
 │   ├── service.py      #   budget resolution, runner assembly, SSE generator, per-run reap

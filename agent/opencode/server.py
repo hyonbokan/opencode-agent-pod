@@ -19,8 +19,8 @@ from uuid import uuid4
 import httpx
 
 from agent.logger import logger
-from agent.opencode.driver import _drain_output, terminate_tree
 from agent.opencode.events import EventConsumer, Watcher
+from agent.opencode.process import drain_output, terminate_tree
 from agent.opencode.providers import build_daemon_env
 
 _HEALTH_PATH = "/api/health"
@@ -150,7 +150,7 @@ class OpencodeServer:
             )
             self._proc = proc
             self._port = port
-            self._drain_task = asyncio.create_task(_drain_output(proc.stdout, self._output))
+            self._drain_task = asyncio.create_task(drain_output(proc.stdout, self._output))
             try:
                 await self._await_healthy()
                 self._client = httpx.AsyncClient(timeout=_CLIENT_TIMEOUT)

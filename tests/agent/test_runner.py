@@ -9,7 +9,7 @@ import pytest
 from pydantic import BaseModel
 
 from agent.errors import SessionStartError
-from agent.opencode.driver import DriverResult, ParsedRun, SessionEnd, WrapUpReason
+from agent.opencode.results import DriverResult, ParsedRun, SessionEnd, WrapUpReason
 from agent.runner import _WEDGE_CONTINUATION_NUDGE, _WEDGE_SPEND_CHARGE, OpencodeRunner
 
 

@@ -15,8 +15,7 @@ import asyncio
 import contextlib
 
 from agent.logger import logger
-from agent.mcp import registered_servers
-from agent.opencode.client import mcp_local_config, register_mcp
+from agent.mcp import mcp_local_config, register_mcp, registered_servers
 from agent.opencode.server import OpencodeServer
 
 _daemons: dict[str, OpencodeServer] = {}

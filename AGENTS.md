@@ -41,9 +41,10 @@ opencode-agent-pod/
 │   ├── permissions.py      #   PermissionSpec
 │   ├── mcp.py              #   config-driven MCP registry (AGENT_MCP_SERVERS)
 │   ├── logger.py           #   the process logger
-│   └── opencode/           #   server (daemon lifecycle), daemon_pool, client, driver,
-│                           #   events (budget/turn caps), providers (model/key map), catalog
-│                           #   (bare model id → provider), permission_config
+│   └── opencode/           #   client (one session: run_session), watcher (spend/turn caps, wrap-up,
+│                           #   live sink), events (shared event consumer), results, server + daemon_pool
+│                           #   (daemon lifecycle), process (tree reaping), providers (model/key map),
+│                           #   catalog (bare model id → provider), permission_config
 ├── pod/                    # the service — FastAPI + SSE over the engine
 │   ├── app.py              #   create_app: bearer auth, POST /agent/run, /health, lifespan drain
 │   ├── service.py          #   budget resolution, runner assembly, the SSE generator, per-run reap

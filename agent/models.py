@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from agent.opencode.driver import WrapUpReason
+from agent.opencode.results import WrapUpReason
 
 # ---------------------------------------------------------------------------
 # Constants

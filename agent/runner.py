@@ -10,11 +10,12 @@ from pydantic import BaseModel
 from agent.errors import SessionStartError
 from agent.logger import logger
 from agent.models import DEFAULT_TOOLS, OpencodeResult, ReasoningEffort, RunSubtype
-from agent.opencode.client import EventSink, run_session
+from agent.opencode.client import run_session
 from agent.opencode.daemon_pool import get_opencode_daemon, recycle_opencode_daemon
-from agent.opencode.driver import DriverResult, SessionEnd, WrapUpReason
 from agent.opencode.providers import to_opencode_model, to_opencode_variant
+from agent.opencode.results import DriverResult, SessionEnd, WrapUpReason
 from agent.opencode.server import OpencodeServer
+from agent.opencode.watcher import EventSink
 from agent.permissions import PermissionSpec
 
 # Sent in place of the original prompt when retrying a wedged session on a fresh daemon: opencode's
