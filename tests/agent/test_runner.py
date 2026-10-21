@@ -89,6 +89,26 @@ def _patch_serve(result=None, *, side_effect=None, capture=None):
 
 
 @pytest.mark.asyncio
+async def test_a_free_run_reports_zero_cost_not_unknown(tmp_path):
+    with _patch_serve(_dr(cost_usd=0.0)):
+        runner = OpencodeRunner(model="claude-sonnet-4-6", max_retries=0)
+        r = await runner.run(user_message="hi", cwd=str(tmp_path))
+
+    assert r.total_cost_usd == 0.0
+    assert r.subagent_cost_usd == 0.0
+
+
+@pytest.mark.asyncio
+async def test_unobserved_spend_reports_unknown_cost(tmp_path):
+    with _patch_serve(_dr(cost_usd=None)):
+        runner = OpencodeRunner(model="claude-sonnet-4-6", max_retries=0)
+        r = await runner.run(user_message="hi", cwd=str(tmp_path))
+
+    assert r.total_cost_usd is None
+    assert r.subagent_cost_usd is None
+
+
+@pytest.mark.asyncio
 async def test_maps_result_and_passes_session_args(tmp_path):
     capture: dict = {}
     with _patch_serve(_dr(text="Found 5 contracts.", cost_usd=0.02, num_turns=3), capture=capture):

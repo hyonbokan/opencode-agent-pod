@@ -47,7 +47,7 @@ class ParsedRun:
 
     text: str = ""
     structured: Any | None = None  # structured output from the run (validated by the caller)
-    cost_usd: float = 0.0
+    cost_usd: float | None = None  # None when no spend was observed, distinct from a $0 run
     num_turns: int = 0
     error: str | None = None
     finish: str | None = None  # the final message's finish reason; "stop" means the model concluded

@@ -95,6 +95,22 @@ async def test_anthropic_key_goes_in_x_api_key_header(upstream):
         await proxy.stop()
 
 
+async def test_a_keyless_provider_forwards_no_auth(upstream):
+    proxy = await _proxy({"vllm": ProviderRoute(upstream, None, "bearer")})
+    try:
+        async with httpx.AsyncClient(base_url=proxy.base_url) as client:
+            await client.post("/vllm/v1/chat", headers={"authorization": "Bearer dummy"})
+        assert "authorization" not in _SEEN["headers"]
+    finally:
+        await proxy.stop()
+
+
+def test_build_routes_leaves_a_keyless_custom_provider_without_a_key():
+    custom = [{"name": "vllm", "base_url": "http://h:8000/v1", "models": ["m"]}]
+    routes = build_routes({"AGENT_CUSTOM_PROVIDERS": json.dumps(custom)})
+    assert routes["vllm"].api_key is None
+
+
 async def test_forwards_path_and_body_to_the_upstream(upstream):
     proxy = await _proxy({"openai": ProviderRoute(upstream, "k", "bearer")})
     try:

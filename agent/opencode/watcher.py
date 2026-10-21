@@ -16,6 +16,7 @@ from typing import Any
 from agent.logger import logger
 from agent.mcp import mcp_tool_ids
 from agent.opencode.events import NO_ACTION, WatchAction, session_id_of
+from agent.opencode.permission_config import BUILTIN_TOOL_PERMISSIONS
 from agent.opencode.results import WrapUpReason
 
 # Event stream envelope. The daemon-global SSE stream carries one JSON object per ``data:`` line; a
@@ -54,25 +55,8 @@ _CHILD_WRAP_UP_TEXT = (
     "suspect it. Then list what you did not get to check."
 )
 # The tool a structured run answers through. opencode adds it before applying the per-message tools
-# map, so it stays available only because the wrap-up tools map leaves it out. Recheck this list
-# when bumping opencode: a built-in tool missing from it stays on during a wrap-up.
+# map, so it stays available only because the wrap-up tools map leaves it out.
 _ANSWER_TOOL = "StructuredOutput"
-_BUILTIN_TOOLS: tuple[str, ...] = (
-    "question",
-    "bash",
-    "read",
-    "glob",
-    "grep",
-    "list",
-    "edit",
-    "write",
-    "apply_patch",
-    "task",
-    "webfetch",
-    "todowrite",
-    "websearch",
-    "skill",
-)
 
 
 class SessionWatcher:
@@ -303,7 +287,7 @@ class SessionWatcher:
 
 def wrap_up_tools() -> dict[str, bool]:
     """The per-message tools map that switches off every built-in and registered MCP tool."""
-    return dict.fromkeys((*_BUILTIN_TOOLS, *mcp_tool_ids()), False)
+    return dict.fromkeys((*BUILTIN_TOOL_PERMISSIONS, *mcp_tool_ids()), False)
 
 
 def _child_wrap_up_body(info: dict[str, Any]) -> dict[str, Any] | None:

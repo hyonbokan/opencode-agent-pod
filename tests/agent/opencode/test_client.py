@@ -436,6 +436,7 @@ async def test_run_session_timeout_is_terminal():
     result = await _run(handler, response_model=None, timeout=1.0)
     assert result.end is SessionEnd.TIMED_OUT
     assert result.parsed.structured is None
+    assert result.parsed.cost_usd is None  # no step finished, so the spend is unknown, not $0
 
 
 @pytest.mark.asyncio
