@@ -2,8 +2,8 @@
 
 Create a session on the daemon, register a watcher with the daemon's shared event consumer, and send
 one prompt. The prompt response carries the structured output and final text; the watcher, fed the
-session's events by the consumer, carries the per-step cost, tokens, and tool calls, which are summed
-into the run's cost and turns and rebuilt into the trace timeline. Watching live lets a budget or turn
+session's events by the consumer, carries the per-step cost and tool calls, which are summed into
+the run's cost and turns and streamed to an optional live sink. Watching live lets a budget or turn
 cap abort the session mid-flight, and lets an opted-in run ask every running session to wrap up
 first. Subagents' spend counts toward the run's budget. Permissions, tools, the system prompt, and
 the structured-output schema are all set per session and per request.
@@ -22,20 +22,19 @@ import httpx
 from pydantic import BaseModel
 
 from agent.errors import SessionStartError
+from agent.logger import logger
+from agent.mcp import McpServer, mcp_tool_ids
 from agent.opencode.driver import (
     DriverResult,
     ParsedRun,
     SessionEnd,
     WrapUpReason,
-    build_timeline,
 )
 from agent.opencode.events import NO_ACTION, WatchAction, session_id_of
 from agent.opencode.permission_config import permission_config
 from agent.opencode.providers import format_schema, provider_of
 from agent.opencode.server import OpencodeServer
 from agent.permissions import PermissionSpec
-from core.tools.mcp import McpServer, mcp_tool_ids
-from core.utils.logger import logger
 
 # Retries opencode makes internally to coax a schema-valid structured output before giving up.
 _STRUCTURED_RETRY_COUNT = 2
@@ -198,13 +197,6 @@ def wrap_up_tools() -> dict[str, bool]:
 _PART_EVENT = "message.part.updated"
 _MESSAGE_EVENT = "message.updated"
 _IDLE_EVENT = "session.idle"
-# serve names part types with hyphens; the timeline uses underscores. A type absent here is dropped.
-_PART_TYPE_MAP: dict[str, str] = {
-    "step-start": "step_start",
-    "step-finish": "step_finish",
-    "tool": "tool_use",
-    "text": "text",
-}
 
 # A sink for live per-event updates as a run works: assistant-text deltas (``{"kind": "token",
 # "text": …}``) and tool-call state transitions (``{"kind": "tool", "id", "name", "status",
@@ -214,13 +206,13 @@ EventSink = Callable[[dict[str, Any]], None]
 
 
 class _SessionWatcher:
-    """Track one run's cost, turns, and timeline from the event stream, flagging when a budget or
+    """Track one run's cost and turns from the event stream, flagging when a budget or
     turn cap is crossed and, if given a root wrap-up message, when to ask sessions to wrap up.
     ``wrap_up_at`` is checked on every event, not only at step ends, since a step can run long.
 
     The consumer feeds it the root session's events and its subagents'. Every step-finish adds its
     cost; only the root's count as turns, since subagents have their own step limit. Only the root's
-    parts enter the timeline and the live sink. The watcher stays pure — it returns what to do and
+    parts reach the live sink. The watcher stays pure — it returns what to do and
     the consumer does it — so the accounting is testable offline.
     """
 
@@ -239,7 +231,7 @@ class _SessionWatcher:
         self._wrap_up = wrap_up_body is not None
         self._wrap_up_at = wrap_up_at  # a time.monotonic() reading
         self.cost = 0.0
-        self.subagent_cost = 0.0  # what the timeline misses, as it holds root steps only
+        self.subagent_cost = 0.0  # the part of cost spent by subagent steps
         self.turns = 0
         # Any step, a subagent's included: proof the stream delivered, even with no root turn yet.
         self.saw_steps = False
@@ -257,11 +249,6 @@ class _SessionWatcher:
         self._told: set[str] = set()
         self._finishing: set[str] = set()
         self._answer_steps: set[str] = set()  # message ids of steps that called the answer tool
-        # Timeline part snapshots keyed by opencode's stable part id, latest kept: opencode re-sends a
-        # full snapshot on every update (a bash tool re-emits its whole output per stdout chunk), so
-        # keying by id collapses the hundreds of snapshots per part to one. First-seen order is kept.
-        self._parts: dict[str, dict[str, Any]] = {}
-        self._anon_seq = 0  # synthetic keys for a part with no id, so those are never merged
         self.idle = asyncio.Event()
         # Live-update sink plus the per-part state that keeps its stream free of the snapshot spam:
         # how many chars of each text part were already emitted (so only the new tail is sent) and the
@@ -273,11 +260,6 @@ class _SessionWatcher:
         # text part (with no step), so text is streamed only for messages seen here — the assistant's,
         # not the echoed prompt.
         self._generating_messages: set[str] = set()
-
-    @property
-    def part_snapshots(self) -> list[dict[str, Any]]:
-        """The latest snapshot of each part, in first-seen order, for the timeline."""
-        return list(self._parts.values())
 
     def process(self, event: dict[str, Any]) -> WatchAction:
         """Fold one event into the running state and say what the consumer should do about it."""
@@ -300,7 +282,7 @@ class _SessionWatcher:
             return NO_ACTION
         part = props.get("part") or {}
         if is_root:
-            self._record_part(part)
+            self._stream_part(part)
         is_answer_call = part.get("type") == "tool" and part.get("tool") == _ANSWER_TOOL
         if is_answer_call and isinstance(part.get("messageID"), str):
             self._answer_steps.add(part["messageID"])
@@ -320,26 +302,16 @@ class _SessionWatcher:
             self._finishing.discard(session_id)
         return self._check_limits()
 
-    def _record_part(self, part: dict[str, Any]) -> None:
-        part_type = part.get("type")
-        run_type = _PART_TYPE_MAP.get(part_type) if isinstance(part_type, str) else None
-        if run_type is None:
-            return
+    def _stream_part(self, part: dict[str, Any]) -> None:
+        if part.get("type") in ("step-start", "step-finish") and isinstance(
+            part.get("messageID"), str
+        ):
+            self._generating_messages.add(part["messageID"])
+        # opencode re-sends a full snapshot of a part on every update; its stable id is what lets
+        # the live stream send only what changed.
         part_id = part.get("id")
-        if not isinstance(part_id, str):
-            part_id = f"_anon{self._anon_seq}"
-            self._anon_seq += 1
-        # opencode's step parts carry no timestamp, so stamp arrival time for the trace timeline.
-        self._parts[part_id] = {
-            "type": run_type,
-            "part": part,
-            "timestamp": int(time.time() * 1000),
-        }
-        if run_type in ("step_start", "step_finish"):
-            message_id = part.get("messageID")
-            if isinstance(message_id, str):
-                self._generating_messages.add(message_id)
-        self._emit_live(part_id, run_type, part)
+        if isinstance(part_id, str):
+            self._emit_live(part_id, part)
 
     def _check_limits(self) -> WatchAction:
         if self.budget_exceeded or self.turns_exceeded:
@@ -404,12 +376,12 @@ class _SessionWatcher:
             return NO_ACTION
         return NO_ACTION if self.wrap_up_reason is None else self._wrap_up_prompts()
 
-    def _emit_live(self, part_id: str, run_type: str, part: dict[str, Any]) -> None:
+    def _emit_live(self, part_id: str, part: dict[str, Any]) -> None:
         """Push a live update — a text delta or a tool-call transition — to the sink, if one is set.
         Best-effort: a failing sink is logged and swallowed so it can't disturb cap enforcement."""
         if self._event_sink is None:
             return
-        event = self._live_event(part_id, run_type, part)
+        event = self._live_event(part_id, part)
         if event is None:
             return
         try:
@@ -417,9 +389,7 @@ class _SessionWatcher:
         except Exception as e:
             logger.debug("live event sink raised; dropping update: %s", e)
 
-    def _live_event(
-        self, part_id: str, run_type: str, part: dict[str, Any]
-    ) -> dict[str, Any] | None:
+    def _live_event(self, part_id: str, part: dict[str, Any]) -> dict[str, Any] | None:
         """Normalize a part update into a live event, or None when it carries nothing new.
 
         A text part yields only its newly-appended tail — opencode resends the whole text on every
@@ -429,7 +399,7 @@ class _SessionWatcher:
         the call's input and, once it finishes, its output; the repeated same-status snapshots in
         between are dropped.
         """
-        if run_type == "text":
+        if part.get("type") == "text":
             if part.get("messageID") not in self._generating_messages:
                 return None
             full = part.get("text")
@@ -440,7 +410,7 @@ class _SessionWatcher:
                 return None
             self._emitted_text[part_id] = len(full)
             return {"kind": "token", "text": full[seen:]}
-        if run_type == "tool_use":
+        if part.get("type") == "tool":
             state = part.get("state")
             state = state if isinstance(state, dict) else {}
             status = state.get("status")
@@ -516,7 +486,7 @@ def _to_driver_result(
 ) -> DriverResult:
     """Map the prompt response and the watched stream onto a DriverResult.
 
-    The watcher supplies cost, turns, and timeline whenever it saw any steps. If it saw none, the
+    The watcher supplies cost and turns whenever it saw any steps. If it saw none, the
     session's own aggregate is used when available, since the final message reports only its last
     step's cost.
     """
@@ -550,7 +520,6 @@ def _to_driver_result(
         returncode=0,
         duration_ms=duration_ms,
         end=_session_end(watcher),
-        timeline=build_timeline(watcher.part_snapshots),
         subagent_cost_usd=watcher.subagent_cost,
         session_id=session_id,
         wrap_up_reason=watcher.wrap_up_reason,
@@ -581,7 +550,6 @@ def _cut_short_result(
         returncode=returncode,
         duration_ms=duration_ms,
         end=end,
-        timeline=build_timeline(watcher.part_snapshots),
         subagent_cost_usd=watcher.subagent_cost,
         session_id=session_id,
         wrap_up_reason=watcher.wrap_up_reason,
@@ -718,7 +686,7 @@ async def run_session(
             )
             if timed_out:
                 # Abort so the daemon stops spending, then report the timeout with the partial cost
-                # and timeline the watcher gathered (an empty result would under-count overruns).
+                # the watcher gathered (an empty result would under-count overruns).
                 with contextlib.suppress(httpx.HTTPError, RuntimeError):
                     await client.post(f"{base_url}/session/{session_id}/abort", json={})
                 return _cut_short_result(

@@ -9,8 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.models import OpencodeResult, RunSubtype
-from llm import ReasoningEffort
+from agent.models import OpencodeResult, ReasoningEffort, RunSubtype
 from pod import service
 from pod.schema import RunRequest, Workspace, response_model_from_schema
 from pod.settings import PodSettings

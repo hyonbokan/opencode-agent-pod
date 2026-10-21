@@ -33,9 +33,6 @@ RUN pip install -r requirements.txt
 
 # Application code. Tests, scripts, docs, and secrets are excluded via .dockerignore.
 COPY agent/ ./agent/
-COPY core/ ./core/
-COPY llm/ ./llm/
-COPY config/ ./config/
 COPY pod/ ./pod/
 
 # The pod runs LLM-authored shell commands, so it runs as a non-root user with a writable home for

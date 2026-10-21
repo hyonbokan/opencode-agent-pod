@@ -16,10 +16,9 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from core.utils.logger import logger
-from llm import ReasoningEffort
-from llm.models import get_provider_for_model, supports_xhigh_effort
-from llm.types import Provider
+from agent.logger import logger
+from agent.models import ReasoningEffort
+from agent.opencode.catalog import Provider, get_provider_for_model, supports_xhigh_effort
 
 # Our provider enum -> opencode's provider segment. Key injection is handled separately by
 # build_daemon_env (via _KEY_ALIAS), so only the opencode name is needed here.

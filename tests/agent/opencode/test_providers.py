@@ -8,6 +8,8 @@ import json
 import pytest
 from pydantic import BaseModel
 
+from agent.models import ReasoningEffort
+from agent.opencode.catalog import AnthropicModels, GeminiModels, GrokModels, OpenAIModels
 from agent.opencode.providers import (
     DUMMY_PROXY_KEY,
     CustomProvider,
@@ -19,8 +21,6 @@ from agent.opencode.providers import (
     to_opencode_model,
     to_opencode_variant,
 )
-from llm import ReasoningEffort
-from llm.models import AnthropicModels, GeminiModels, GrokModels, OpenAIModels
 
 
 @pytest.mark.parametrize(

@@ -2,10 +2,9 @@
 
 The pod bakes in no MCP tools. A deployment declares its MCP servers in the env var
 ``AGENT_MCP_SERVERS`` — a JSON array of ``{name, command, tools}`` objects, where ``command`` is
-the argv that launches a local server process and ``tools`` names the tools it exposes. The daemon
-registers each server on startup (see the daemon pool) and the per-session ruleset gates their
-tools by the run's allow-list (see the client). With none declared, an agent has only opencode's
-built-in filesystem/exec tools.
+the argv that launches a local server process and ``tools`` names the tools it exposes. Every
+declared server is registered on each daemon at startup; which tools a run may call is decided by
+its own allow-list. With none declared, an agent has only opencode's built-in filesystem/exec tools.
 """
 
 from __future__ import annotations

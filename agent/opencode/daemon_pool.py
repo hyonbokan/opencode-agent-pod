@@ -14,10 +14,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 
+from agent.logger import logger
+from agent.mcp import registered_servers
 from agent.opencode.client import mcp_local_config, register_mcp
 from agent.opencode.server import OpencodeServer
-from core.tools.mcp import registered_servers
-from core.utils.logger import logger
 
 _daemons: dict[str, OpencodeServer] = {}
 # asyncio.Lock binds to the running loop on first acquire (not at construction), so a module-level

@@ -18,7 +18,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from core.utils.logger import logger
+from agent.logger import logger
 
 # The stream normally opens in well under a second; if it can't within this, the daemon start that
 # awaits it fails and is retried/relaunched rather than serving runs whose caps can't be enforced.

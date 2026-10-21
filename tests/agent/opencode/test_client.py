@@ -14,6 +14,7 @@ import pytest
 from pydantic import BaseModel
 
 from agent.errors import SessionStartError
+from agent.mcp import McpServer, mcp_tool_ids
 from agent.opencode import client as client_mod
 from agent.opencode.client import (
     _CHILD_WRAP_UP_TEXT,
@@ -27,12 +28,11 @@ from agent.opencode.client import (
     to_permission_ruleset,
     wrap_up_tools,
 )
-from agent.opencode.driver import DriverResult, ParsedRun, SessionEnd, build_timeline
+from agent.opencode.driver import DriverResult, ParsedRun, SessionEnd
 from agent.opencode.providers import format_schema
 from agent.opencode.server import OpencodeServer
 from agent.permissions import PermissionSpec
 from agent.runner import OpencodeRunner
-from core.tools.mcp import McpServer, mcp_tool_ids
 
 _DEMO_SERVER = McpServer(name="demo", command=("python", "srv.py"), tools=("lookup", "fetch"))
 _DEMO_SERVERS_JSON = json.dumps(
@@ -317,7 +317,6 @@ async def test_run_session_success_aggregates_from_stream_and_sends_expected_bod
     assert result.parsed.text == "done"
     # The finish reason travels through so the runner can tell a concluded run from a truncated one.
     assert result.parsed.finish == "tool-calls"
-    assert len(result.timeline) == 2  # two messageID-grouped steps rebuilt for the trace
     assert result.returncode == 0
 
     assert isinstance(seen["session"]["permission"], list)
@@ -573,7 +572,6 @@ async def test_run_session_reports_spend_when_the_daemon_goes_away_mid_prompt():
     assert result.parsed.cost_usd == pytest.approx(0.003)
     assert result.parsed.num_turns == 1
     assert result.end is SessionEnd.TRANSPORT_LOST
-    assert result.timeline  # the partial work is traceable, not thrown away with the connection
 
 
 @pytest.mark.asyncio
@@ -679,7 +677,6 @@ def test_session_watcher_accumulates_cost_and_caps_budget():
     assert w.process(_pev({"type": "step-finish", "cost": 0.002, "messageID": "m2"})).abort
     assert w.budget_exceeded is True
     assert w.turns == 2
-    assert len(w.part_snapshots) == 2  # both steps captured for the timeline
 
 
 def test_session_watcher_caps_turns_and_records_idle_and_tools():
@@ -688,11 +685,10 @@ def test_session_watcher_caps_turns_and_records_idle_and_tools():
     assert w.process(_pev({"type": "step-finish", "cost": 0.0, "messageID": "m2"})).abort
     assert w.turns_exceeded is True
 
-    # A tool part is captured for the timeline but is not a turn; idle sets the completion flag.
+    # A tool part is not a turn; idle sets the completion flag.
     w2 = _SessionWatcher("s", max_budget_usd=None, max_turns=None)
     w2.process(_pev({"type": "tool", "tool": "read", "messageID": "m1"}))
     assert w2.turns == 0
-    assert len(w2.part_snapshots) == 1
     w2.process({"type": "session.idle", "properties": {"sessionID": "s"}})
     assert w2.idle.is_set()
 
@@ -725,7 +721,7 @@ def test_session_watcher_counts_subagent_spend_but_not_its_turns():
     w.process(_step("s", 0.3))
     assert not w.process(_step("child", 0.5)).abort
     assert w.cost == pytest.approx(0.8)
-    assert w.subagent_cost == pytest.approx(0.5)  # the trace adds this, as the timeline has none
+    assert w.subagent_cost == pytest.approx(0.5)  # reported apart from the root's spend
     assert w.turns == 1
     # The subagent's spend alone can cross the budget and abort the run.
     action = w.process(_step("child", 0.3))
@@ -744,7 +740,7 @@ def test_spend_by_subagents_alone_is_reported_from_the_stream():
     assert parsed.num_turns == 0
 
 
-def test_a_subagent_going_idle_does_not_end_the_run_or_enter_its_timeline():
+def test_a_subagent_going_idle_does_not_end_the_run():
     w = _SessionWatcher("s", max_budget_usd=None, max_turns=None)
     w.process(_user_message("child"))
     w.process(
@@ -756,7 +752,6 @@ def test_a_subagent_going_idle_does_not_end_the_run_or_enter_its_timeline():
     w.process(_idle_event("child"))
 
     assert not w.idle.is_set()
-    assert w.part_snapshots == []
     w.process(_idle_event("s"))
     assert w.idle.is_set()
 
@@ -914,54 +909,6 @@ def test_wrap_up_tools_switch_off_mcp_and_builtins_but_not_structured_output(mon
     assert not any(tools.values())
 
 
-def test_session_watcher_dedups_republished_part_snapshots_by_id():
-    # opencode re-emits a full snapshot of a part on every update (a bash tool re-sends its whole
-    # output per stdout chunk). Keying by the stable part id keeps one entry per part, so a chatty
-    # tool costs one timeline entry with the latest output — not hundreds retained in memory.
-    w = _SessionWatcher("s", max_budget_usd=None, max_turns=None)
-    for chunk in ("a", "ab", "abc"):
-        w.process(
-            _pev(
-                {
-                    "type": "tool",
-                    "id": "prt_1",
-                    "tool": "bash",
-                    "messageID": "m1",
-                    "state": {"status": "running", "output": chunk},
-                }
-            )
-        )
-    # A second, distinct part is its own entry.
-    w.process(_pev({"type": "text", "id": "prt_2", "text": "done", "messageID": "m1"}))
-
-    assert len(w.part_snapshots) == 2  # three bash snapshots collapsed to one, plus the text part
-    bash_line = next(line for line in w.part_snapshots if line["part"]["id"] == "prt_1")
-    assert bash_line["part"]["state"]["output"] == "abc"  # the latest snapshot is kept
-
-    # Parts without an id (e.g. the test fixtures) are never merged.
-    w.process(_pev({"type": "step-finish", "cost": 0.0, "messageID": "m2"}))
-    w.process(_pev({"type": "step-finish", "cost": 0.0, "messageID": "m3"}))
-    assert len(w.part_snapshots) == 4
-
-
-def test_watched_steps_carry_timing_into_the_timeline():
-    # Regression: opencode's serve step parts carry no timestamp of their own, so the watcher must
-    # stamp arrival time — without it every rebuilt step's start/end is None and the trace loses all
-    # step timing/ordering. Feed a real step-start/step-finish pair (the serve part shape) and assert
-    # the step comes out timed and ordered, not null.
-    w = _SessionWatcher("s", max_budget_usd=None, max_turns=None)
-    w.process(_pev({"type": "step-start", "id": "prt_1", "messageID": "m1"}))
-    time.sleep(0.005)
-    w.process(_pev({"type": "step-finish", "id": "prt_2", "cost": 0.001, "messageID": "m1"}))
-
-    timeline = build_timeline(w.part_snapshots)
-    assert len(timeline) == 1
-    step = timeline[0]
-    assert step.start_ms is not None
-    assert step.end_ms is not None
-    assert step.end_ms >= step.start_ms
-
-
 def test_session_watcher_streams_token_deltas_and_tool_transitions():
     # With a sink set, the watcher pushes a live update per real change: a text part yields only its
     # newly-appended tail (opencode resends the whole text each update), and a tool part yields one
@@ -1031,12 +978,11 @@ def test_session_watcher_does_not_stream_the_echoed_prompt():
 
 
 def test_session_watcher_without_a_sink_emits_nothing_extra():
-    # The sink is opt-in: the default watcher still tracks cost/turns/timeline and simply skips the
+    # The sink is opt-in: the default watcher still tracks cost and turns and simply skips the
     # live-event path, so nothing changes for callers that don't want a live trace.
     w = _SessionWatcher("s", max_budget_usd=None, max_turns=None)
     w.process(_pev({"type": "text", "id": "t1", "text": "hi", "messageID": "m1"}))
     assert w.turns == 0
-    assert len(w.part_snapshots) == 1  # timeline still recorded
 
 
 def test_session_watcher_swallows_a_raising_sink():

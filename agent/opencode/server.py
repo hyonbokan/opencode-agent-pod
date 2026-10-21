@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import socket
 import time
 from collections import deque
@@ -17,11 +18,10 @@ from uuid import uuid4
 
 import httpx
 
+from agent.logger import logger
 from agent.opencode.driver import _drain_output, terminate_tree
 from agent.opencode.events import EventConsumer, Watcher
 from agent.opencode.providers import build_daemon_env
-from config import config
-from core.utils.logger import logger
 
 _HEALTH_PATH = "/api/health"
 # ~128 KiB of the daemon's own output kept for crash diagnostics.
@@ -30,6 +30,8 @@ _OUTPUT_TAIL_CHUNKS = 16
 _CLIENT_TIMEOUT = 30.0
 # Health probe used to tell a daemon that stopped serving from a merely busy one.
 _HEALTH_PROBE_TIMEOUT = 5.0
+# How long a launched daemon gets to answer health before the launch counts as failed.
+_SERVE_STARTUP_TIMEOUT = float(os.getenv("AGENT_SERVE_STARTUP_TIMEOUT", "60"))
 # Env var tagged onto the daemon (and inherited by every tool process it spawns) so a crashed
 # daemon's detached, reparented children can still be found and reaped on teardown.
 _REAP_ENV_MARKER = "OPENCODE_POD_REAP_TAG"
@@ -69,7 +71,7 @@ class OpencodeServer:
         self._reap_tag = uuid4().hex
         self._env[_REAP_ENV_MARKER] = self._reap_tag
         self._startup_timeout = (
-            startup_timeout if startup_timeout is not None else config.runner.SERVE_STARTUP_TIMEOUT
+            startup_timeout if startup_timeout is not None else _SERVE_STARTUP_TIMEOUT
         )
         self._proc: asyncio.subprocess.Process | None = None
         self._port: int | None = None

@@ -223,7 +223,7 @@ async def test_structured_run_ending_on_tool_call_finish_is_success(tmp_path):
 
 @pytest.mark.asyncio
 async def test_reasoning_effort_maps_to_variant(tmp_path):
-    from llm import ReasoningEffort
+    from agent.models import ReasoningEffort
 
     capture: dict = {}
     with _patch_serve(capture=capture):

@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import agent.opencode.daemon_pool as pool
-from core.tools.mcp import McpServer
+from agent.mcp import McpServer
 
 _DEMO_SERVER = McpServer(name="demo", command=("python", "srv.py"), tools=("lookup",))
 

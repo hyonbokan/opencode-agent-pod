@@ -18,6 +18,16 @@ DEFAULT_TOOLS: list[str] = [
     "Bash",
 ]
 
+
+class ReasoningEffort(StrEnum):
+    """Reasoning effort a run asks of the model; MAX is the strongest level the model accepts."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    MAX = "max"
+
+
 # ---------------------------------------------------------------------------
 # Public result model
 # ---------------------------------------------------------------------------

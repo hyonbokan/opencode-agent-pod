@@ -1,29 +1,21 @@
 import asyncio
 import contextlib
 import json
+import os
+import random
 import time
 
 from pydantic import BaseModel
 
 from agent.errors import SessionStartError
-from agent.models import DEFAULT_TOOLS, OpencodeResult, RunSubtype
+from agent.logger import logger
+from agent.models import DEFAULT_TOOLS, OpencodeResult, ReasoningEffort, RunSubtype
 from agent.opencode.client import EventSink, run_session
 from agent.opencode.daemon_pool import get_opencode_daemon, recycle_opencode_daemon
 from agent.opencode.driver import DriverResult, SessionEnd, WrapUpReason
 from agent.opencode.providers import to_opencode_model, to_opencode_variant
 from agent.opencode.server import OpencodeServer
 from agent.permissions import PermissionSpec
-from config import config
-from core.integrations.langfuse_opencode import record_opencode_trace
-from core.utils.logger import logger
-from llm import ReasoningEffort
-from llm.utils.retry import RetryConfig
-
-# Background Langfuse trace-ingestion tasks. Each run fires trace recording off its critical path so an
-# agent call never waits on the ingestion roundtrip; the tasks are tracked so flush_pending_traces()
-# can drain them before the process shuts Langfuse down, otherwise a still-in-flight tail trace on the
-# one-shot pod would be lost.
-_pending_trace_tasks: set[asyncio.Task[None]] = set()
 
 # Sent in place of the original prompt when retrying a wedged session on a fresh daemon: opencode's
 # session store outlives the dead daemon, so the retry can continue the same session instead of
@@ -47,29 +39,19 @@ _WRAP_UP_SUBTYPES = {
 }
 
 
-async def flush_pending_traces(timeout: float = 30.0) -> None:
-    """Wait for any in-flight trace-ingestion tasks to land, so they aren't dropped when the pod
-    shuts the Langfuse client down. Best-effort: give up after ``timeout`` rather than hang exit."""
-    if not _pending_trace_tasks:
-        return
-    with contextlib.suppress(TimeoutError):
-        await asyncio.wait_for(
-            asyncio.gather(*_pending_trace_tasks, return_exceptions=True), timeout
-        )
-
-
 # ---------------------------------------------------------------------------
 # Process-wide concurrency limiter
 # ---------------------------------------------------------------------------
 # Constructed lazily so the Semaphore binds to the running event loop rather
 # than the import-time loop (which may not exist yet under asyncio.run).
+_GLOBAL_CONCURRENCY = int(os.getenv("AGENT_GLOBAL_CONCURRENCY", "7"))
 _GLOBAL_AGENT_SEMAPHORE: asyncio.Semaphore | None = None
 
 
 def _get_global_agent_semaphore() -> asyncio.Semaphore:
     global _GLOBAL_AGENT_SEMAPHORE
     if _GLOBAL_AGENT_SEMAPHORE is None:
-        _GLOBAL_AGENT_SEMAPHORE = asyncio.Semaphore(config.runner.GLOBAL_CONCURRENCY)
+        _GLOBAL_AGENT_SEMAPHORE = asyncio.Semaphore(_GLOBAL_CONCURRENCY)
     return _GLOBAL_AGENT_SEMAPHORE
 
 
@@ -145,7 +127,7 @@ class OpencodeRunner:
             )
 
             async def serve(attempt_budget: float | None) -> OpencodeResult:
-                result, driver_result = await self._run_serve(
+                return await self._run_serve(
                     system_prompt=system_prompt,
                     user_message=user_message,
                     cwd=cwd,
@@ -155,8 +137,6 @@ class OpencodeRunner:
                     budget=attempt_budget,
                     event_sink=event_sink,
                 )
-                self._record_trace(driver_result, user_message)
-                return result
 
             result = await serve(budget)
             # An incomplete end is a transient stream cut, not a judged failure, so one fresh
@@ -213,23 +193,6 @@ class OpencodeRunner:
         ):
             result.subtype = _WRAP_UP_SUBTYPES[result.wrap_up_reason]
 
-    def _record_trace(self, driver_result: DriverResult | None, user_message: str) -> None:
-        # Off the critical path: the agent call shouldn't wait on trace ingestion to return. Tracked
-        # so it can be drained at pod shutdown. An empty timeline has nothing to record.
-        if driver_result is None or not driver_result.timeline:
-            return
-        task = asyncio.create_task(
-            asyncio.to_thread(
-                record_opencode_trace,
-                driver_result.timeline,
-                model=self._model,
-                input_message=user_message,
-                subagent_cost_usd=driver_result.subagent_cost_usd,
-            )
-        )
-        _pending_trace_tasks.add(task)
-        task.add_done_callback(_pending_trace_tasks.discard)
-
     async def _recycle_if_wedged(self, cwd: str, daemon: OpencodeServer) -> bool:
         """Evict a daemon that no longer answers health; whether it was wedged."""
         if await daemon.is_responsive():
@@ -248,8 +211,8 @@ class OpencodeRunner:
         variant: str | None,
         budget: float | None,
         event_sink: EventSink | None = None,
-    ) -> tuple[OpencodeResult, DriverResult | None]:
-        """Run one query on a serve daemon and return the result plus the driver's raw result.
+    ) -> OpencodeResult:
+        """Run one query on a serve daemon and return its result.
 
         A daemon for the project directory comes from the pool and one HTTP session sends the
         prompt. Timeout, budget, and turn cap are enforced inside the session as terminal results;
@@ -258,7 +221,7 @@ class OpencodeRunner:
         same session with a continuation nudge instead of starting over, since opencode's session
         store outlives the dead daemon.
         """
-        retry_cfg = RetryConfig(max_retries=self._max_retries, base_delay=2.0, max_delay=10.0)
+        attempts = self._max_retries + 1
         last_error: Exception | None = None
         start_time = time.monotonic()
         discarded: OpencodeResult | None = None  # attempts a wedge threw away, still charged
@@ -267,7 +230,7 @@ class OpencodeRunner:
         wedge_spend = 0.0  # what those discarded attempts cost, charged against the retry's budget
         attempt_budget = budget
 
-        for attempt in range(retry_cfg.max_retries + 1):
+        for attempt in range(attempts):
             daemon = None
             try:
                 daemon = await get_opencode_daemon(cwd)
@@ -308,10 +271,10 @@ class OpencodeRunner:
                     logger.warning(
                         "Attempt %d/%d wedged with $%.4f of the run's budget spent; not resuming",
                         attempt + 1,
-                        retry_cfg.max_retries + 1,
+                        attempts,
                         wedge_spend,
                     )
-                if not wedged or attempt == retry_cfg.max_retries or budget_spent:
+                if not wedged or attempt == self._max_retries or budget_spent:
                     # Every attempt here shares one session, so a cost read off that session's
                     # aggregate already covers them.
                     if discarded is not None:
@@ -319,9 +282,7 @@ class OpencodeRunner:
                             discarded,
                             cost_already_counted=driver_result.parsed.cost_is_session_total,
                         )
-                    return result, driver_result
-                # Traced on its own: the spend carried above has to be explainable somewhere.
-                self._record_trace(driver_result, next_message)
+                    return result
                 if discarded is None:
                     discarded = result
                 else:
@@ -332,7 +293,7 @@ class OpencodeRunner:
                     "Attempt %d/%d wedged mid-session ($%.4f charged); continuing session %s on a "
                     "fresh daemon (budget left: %s)",
                     attempt + 1,
-                    retry_cfg.max_retries + 1,
+                    attempts,
                     result.total_cost_usd or 0.0,
                     resume_session_id,
                     "uncapped" if attempt_budget is None else f"${attempt_budget:.4f}",
@@ -343,20 +304,18 @@ class OpencodeRunner:
                 logger.warning(
                     "Attempt %d/%d failed to start serve session: %s: %s",
                     attempt + 1,
-                    retry_cfg.max_retries + 1,
+                    attempts,
                     type(e).__name__,
                     e,
                 )
                 # A daemon that stopped serving stays alive, so nothing else evicts it.
                 if daemon is not None and isinstance(e, SessionStartError):
                     await self._recycle_if_wedged(cwd, daemon)
-            if attempt < retry_cfg.max_retries:
-                await asyncio.sleep(retry_cfg.get_delay(attempt))
+            if attempt < self._max_retries:
+                await asyncio.sleep(_retry_delay(attempt))
 
         elapsed = int((time.monotonic() - start_time) * 1000)
-        logger.error(
-            "All %d attempts exhausted. Last error: %s", retry_cfg.max_retries + 1, last_error
-        )
+        logger.error("All %d attempts exhausted. Last error: %s", attempts, last_error)
         return OpencodeResult(
             text=str(last_error) or "opencode serve execution failed",
             is_error=True,
@@ -364,7 +323,7 @@ class OpencodeRunner:
             subagent_cost_usd=discarded.subagent_cost_usd if discarded is not None else None,
             duration_ms=elapsed,  # measured from the first attempt, so it already spans them all
             subtype=RunSubtype.ERROR_SESSION_START,
-        ), None
+        )
 
     @staticmethod
     def _to_result(driver_result: DriverResult, *, expects_structured: bool) -> OpencodeResult:
@@ -414,6 +373,11 @@ class OpencodeRunner:
             finish=parsed.finish,
             wrap_up_reason=driver_result.wrap_up_reason,
         )
+
+
+def _retry_delay(attempt: int) -> float:
+    """Backoff before the next attempt: doubling from 2s, capped at 10s, with ±25% jitter."""
+    return min(2.0 * 2**attempt, 10.0) * random.uniform(0.75, 1.25)
 
 
 def _emit_retry(event_sink: EventSink | None, reason: str) -> None:

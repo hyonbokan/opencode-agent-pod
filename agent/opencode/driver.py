@@ -1,9 +1,4 @@
-"""Parse the opencode event stream into a timeline and reap process trees.
-
-Holds the pure event parsing that reconstructs a per-step timeline (assistant text, tokens, cost, tool
-calls) for trace recreation, the result dataclasses the client fills, and the process-tree reaping the
-daemon manager uses to shut a daemon down.
-"""
+"""The result dataclasses a session fills, and the process-tree reaping used to shut a daemon down."""
 
 from __future__ import annotations
 
@@ -12,13 +7,13 @@ import contextlib
 import os
 import signal
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
 import psutil
 
-from core.utils.logger import logger
+from agent.logger import logger
 
 # The daemon's output is drained in fixed-size chunks (never by line, so a newline-free flood cannot
 # overrun the reader) into a bounded ring buffer that keeps only the tail for diagnostics.
@@ -41,108 +36,6 @@ class ParsedRun:
     cost_is_session_total: bool = False
     # The provider failed the call after opencode's own retries, so another model could still answer
     provider_failed: bool = False
-
-
-@dataclass
-class TimelineTool:
-    """One tool call inside a step, with its arguments, result, and wall-clock span (epoch ms)."""
-
-    name: str
-    input: Any = None
-    output: Any = None
-    start_ms: int | None = None
-    end_ms: int | None = None
-
-
-@dataclass
-class TimelineStep:
-    """One model generation — the events sharing a ``messageID`` between a step_start and its
-    step_finish — carrying the step's timing, token breakdown, cost, assistant text, and tools."""
-
-    message_id: str
-    start_ms: int | None = None
-    end_ms: int | None = None
-    cost_usd: float = 0.0
-    tokens: dict[str, int] = field(default_factory=dict)
-    text: str = ""
-    tools: list[TimelineTool] = field(default_factory=list)
-
-
-def _normalize_tokens(tokens: dict[str, Any]) -> dict[str, int]:
-    """Flatten opencode's token breakdown (nested ``cache.{read,write}``) into the flat keys a
-    Langfuse usage detail expects, dropping anything non-numeric."""
-    cache = tokens.get("cache")
-    cache = cache if isinstance(cache, dict) else {}
-    flat = {
-        "input": tokens.get("input"),
-        "output": tokens.get("output"),
-        "reasoning": tokens.get("reasoning"),
-        "cache_read": cache.get("read"),
-        "cache_write": cache.get("write"),
-        "total": tokens.get("total"),
-    }
-    return {k: int(v) for k, v in flat.items() if isinstance(v, (int, float))}
-
-
-def build_timeline(events: list[dict[str, Any]]) -> list[TimelineStep]:
-    """Reconstruct the per-step timeline from decoded event dicts, for trace recreation.
-
-    Events are grouped into steps by their ``messageID`` (a step_start opens the step, its
-    step_finish closes it with tokens and cost, and the text and tool_use events in between belong
-    to it). Steps keep the order in which they first appear.
-    """
-    steps: dict[str, TimelineStep] = {}
-    order: list[str] = []
-
-    def _step(message_id: str) -> TimelineStep:
-        if message_id not in steps:
-            steps[message_id] = TimelineStep(message_id=message_id)
-            order.append(message_id)
-        return steps[message_id]
-
-    for ev in events:
-        if not isinstance(ev, dict):
-            continue
-        part = ev.get("part", {}) if isinstance(ev.get("part"), dict) else {}
-        message_id = part.get("messageID")
-        if not isinstance(message_id, str):
-            continue
-        etype = ev.get("type")
-        ts = ev.get("timestamp")
-        if etype == "step_start":
-            step = _step(message_id)
-            if isinstance(ts, (int, float)):
-                step.start_ms = int(ts)
-        elif etype == "step_finish":
-            step = _step(message_id)
-            if isinstance(ts, (int, float)):
-                step.end_ms = int(ts)
-            cost = part.get("cost")
-            if isinstance(cost, (int, float)):
-                step.cost_usd = float(cost)
-            tokens = part.get("tokens")
-            if isinstance(tokens, dict):
-                step.tokens = _normalize_tokens(tokens)
-        elif etype == "text":
-            _step(message_id).text += part.get("text", "")
-        elif etype == "tool_use":
-            state = part.get("state")
-            state = state if isinstance(state, dict) else {}
-            timing = state.get("time")
-            timing = timing if isinstance(timing, dict) else {}
-            start_ms = timing.get("start")
-            end_ms = timing.get("end")
-            _step(message_id).tools.append(
-                TimelineTool(
-                    name=part.get("tool", "?"),
-                    input=state.get("input"),
-                    output=state.get("output"),
-                    start_ms=int(start_ms) if isinstance(start_ms, (int, float)) else None,
-                    end_ms=int(end_ms) if isinstance(end_ms, (int, float)) else None,
-                )
-            )
-
-    return [steps[mid] for mid in order]
 
 
 async def _descendants(root_pid: int) -> list[int]:
@@ -289,8 +182,7 @@ class DriverResult:
     returncode: int | None
     duration_ms: int
     end: SessionEnd = SessionEnd.REPLIED
-    timeline: list[TimelineStep] = field(default_factory=list)
-    subagent_cost_usd: float = 0.0  # spend of subagent steps, which the timeline leaves out
+    subagent_cost_usd: float = 0.0  # the part of the run's spend made by subagent steps
     # The opencode session this run used. A wedged run's session outlives the dead daemon (opencode's
     # store is daemon-independent), so the runner can continue it on a fresh daemon.
     session_id: str | None = None

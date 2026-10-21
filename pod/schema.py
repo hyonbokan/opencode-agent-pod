@@ -11,7 +11,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from llm import ReasoningEffort
+from agent.models import ReasoningEffort
 
 
 class Workspace(BaseModel):
