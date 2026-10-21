@@ -1,11 +1,11 @@
 """Drive one ``opencode serve`` session over HTTP and map it onto a DriverResult.
 
 Create a session on the daemon, register a watcher with the daemon's shared event consumer, and send
-one prompt. The prompt response carries the structured output and final text; the watcher, fed the
-session's events by the consumer, carries the per-step cost, tokens, and tool calls, which are summed
-into the run's cost and turns and rebuilt into the trace timeline. Watching live lets a budget or turn
-cap abort the session mid-flight. Permissions, tools, the system prompt, and the structured-output
-schema are all set per session and per request.
+one prompt. The prompt response carries the structured output and final text; the watcher carries
+the run's spend and turns, enforces its caps, and streams progress to an optional live sink. A
+health-probe watchdog runs alongside the prompt so a daemon that stops serving is caught well before
+the session timeout. Permissions, tools, the system prompt, and the structured-output schema are all
+set per session and per request.
 """
 
 from __future__ import annotations
@@ -14,20 +14,26 @@ import asyncio
 import contextlib
 import json
 import time
-from collections.abc import Callable
 from typing import Any
 
 import httpx
 from pydantic import BaseModel
 
 from agent.errors import SessionStartError
-from agent.opencode.driver import DriverResult, ParsedRun, build_timeline
+from agent.logger import logger
+from agent.mcp import mcp_tool_ids
 from agent.opencode.permission_config import permission_config
-from agent.opencode.providers import provider_of
+from agent.opencode.providers import format_schema, provider_of
+from agent.opencode.results import DriverResult, ParsedRun, SessionEnd
 from agent.opencode.server import OpencodeServer
+from agent.opencode.watcher import (
+    ROOT_WRAP_UP_TEXT,
+    WRAP_UP_TIME_MARGIN_S,
+    EventSink,
+    SessionWatcher,
+    wrap_up_tools,
+)
 from agent.permissions import PermissionSpec
-from core.tools.mcp import McpServer, mcp_tool_ids
-from core.utils.logger import logger
 
 # Retries opencode makes internally to coax a schema-valid structured output before giving up.
 _STRUCTURED_RETRY_COUNT = 2
@@ -35,40 +41,214 @@ _STRUCTURED_RETRY_COUNT = 2
 # Short wait for the trailing step-finish plus idle marker to arrive after the prompt POST returns.
 _IDLE_DRAIN_TIMEOUT = 3.0
 
+# Final-message error names that mean the provider, not the run, failed: an API error opencode
+# already retried, or a rejected key. A context overflow is left out — it is the prompt's size.
+_PROVIDER_ERROR_NAMES = frozenset({"APIError", "ProviderAuthError"})
 
-def mcp_local_config(server: McpServer) -> dict[str, Any]:
-    """Build the ``POST /mcp`` config that registers one local MCP server on the daemon.
+# How often to probe the daemon's health while a message is in flight, and how many consecutive
+# misses to treat as wedged rather than a transient blip (e.g. the daemon briefly busy on a heavy
+# tool call). A wedge is otherwise invisible until the full session timeout elapses, since the
+# prompt POST blocks silently until the run finishes or that timeout fires.
+_WEDGE_POLL_INTERVAL = 20.0
+_WEDGE_POLL_MISSES = 2
 
-    The command comes straight from deployment config; the pod injects nothing, so a server that
-    needs the workspace directory must carry it in its own declared argv.
-    """
-    return {"type": "local", "command": list(server.command), "enabled": True}
 
-
-async def register_mcp(
-    base_url: str,
-    name: str,
-    config: dict[str, Any],
+async def run_session(
+    server: OpencodeServer,
     *,
-    client: httpx.AsyncClient,
-) -> dict[str, Any]:
-    """Register an MCP server on the daemon, failing unless it reports connected.
+    opencode_model: str,
+    system_prompt: str | None,
+    user_message: str,
+    variant: str | None,
+    spec: PermissionSpec,
+    tools: list[str],
+    cwd: str,
+    response_model: type[BaseModel] | None,
+    timeout: float,
+    max_budget_usd: float | None = None,
+    max_turns: int | None = None,
+    wrap_up: bool = False,
+    resume_session_id: str | None = None,
+    event_sink: EventSink | None = None,
+) -> DriverResult:
+    """Run one prompt as a serve session and return the mapped result.
 
-    Registration is daemon-wide, so it happens once after the daemon is healthy, not per request.
-    A server process that never spawns, or spawns and dies, still gets a 200 response — only the
-    carried status says so. Left unchecked, every agent on the daemon would silently run without
-    the server's tools, so a non-connected status raises here instead.
+    Spend (subagents' included) and steps are tracked live off the daemon's shared event stream, via
+    a watcher registered for this session; crossing the budget or turn cap aborts the session. With
+    ``wrap_up``, nearing either cap or the timeout first sends every running session a message that
+    disables its tools and asks for its answer, so the run can still deliver one. When
+    ``event_sink`` is given it receives live text deltas and tool-call transitions as they arrive.
+    Failures before the prompt is sent (caps unenforceable, session create) raise SessionStartError
+    for the runner to retry; once the prompt is in flight, a timeout returns a timed-out or wedged
+    result and a transport failure an error result — never a raise, so a charged run is not
+    silently re-run.
+
+    ``resume_session_id`` sends the prompt into an existing session instead of creating a new one —
+    used to nudge a wedged run's session back to life on a fresh daemon. opencode's session store
+    lives outside the daemon process, so the session (and its permission ruleset) survives a crash;
+    only the daemon serving it needs replacing.
     """
-    resp = await client.post(f"{base_url}/mcp", json={"name": name, "config": config})
-    resp.raise_for_status()
-    payload = resp.json()
-    entry = payload.get(name) if isinstance(payload, dict) else None
-    entry = entry if isinstance(entry, dict) else {}
-    if entry.get("status") != "connected":
-        raise RuntimeError(
-            f"MCP server {name!r} failed to connect: {entry.get('error') or entry or payload}"
+    base_url = server.base_url
+    client = server.client
+    t0 = time.monotonic()
+    # Stays None until the session is actually in play, so the cleanup below only ever touches a
+    # session this call genuinely used.
+    session_id: str | None = None
+    skip_cleanup = False
+    try:
+        # Caps are enforced off the shared event stream, so a capped run must not proceed while it is
+        # disconnected. It's pre-prompt, so raise for the runner to retry; uncapped runs proceed.
+        if (max_budget_usd is not None or max_turns is not None) and not server.events_ready:
+            raise SessionStartError("event stream unavailable; cap cannot be enforced")
+
+        if resume_session_id is not None:
+            session_id = resume_session_id
+        else:
+            ruleset = to_permission_ruleset(spec, tools, cwd)
+            try:
+                session = await client.post(f"{base_url}/session", json={"permission": ruleset})
+                session.raise_for_status()
+                session_id = str(session.json()["id"])
+            except (httpx.HTTPError, RuntimeError) as e:
+                # Pre-prompt and idempotent (RuntimeError covers the shared client being closed by a
+                # concurrent daemon eviction): raise so the runner retries against a fresh daemon.
+                raise SessionStartError(
+                    f"session create failed: {type(e).__name__}: {str(e)[:300]}"
+                ) from e
+
+        body = build_message_body(
+            opencode_model=opencode_model,
+            system_prompt=system_prompt,
+            user_message=user_message,
+            variant=variant,
+            response_model=response_model,
         )
-    return payload
+        wrap_up_body = None
+        if wrap_up:
+            # Same model and format as the original, so the structured answer stays available.
+            wrap_up_body = {
+                **build_message_body(
+                    opencode_model=opencode_model,
+                    system_prompt=system_prompt,
+                    user_message=ROOT_WRAP_UP_TEXT,
+                    variant=variant,
+                    response_model=response_model,
+                ),
+                "tools": wrap_up_tools(),
+            }
+
+        # Register before sending the prompt (events for a session only start once the prompt runs),
+        # so the shared consumer routes this session's events to the watcher without a gap.
+        watcher = SessionWatcher(
+            session_id,
+            max_budget_usd,
+            max_turns,
+            wrap_up_body,
+            wrap_up_at=t0 + timeout - WRAP_UP_TIME_MARGIN_S if wrap_up else None,
+            event_sink=event_sink,
+        )
+        server.add_watcher(session_id, watcher)
+
+        message_json: dict[str, Any] = {}
+        post_task = asyncio.ensure_future(
+            client.post(f"{base_url}/session/{session_id}/message", json=body, timeout=timeout)
+        )
+        wedge_task = asyncio.ensure_future(_wait_for_wedge(server))
+        try:
+            # Race the prompt against both the wall-clock cap (asyncio.wait's own timeout — httpx's
+            # timeout only bounds the gap between response bytes, and the prompt POST blocks silently
+            # until the run finishes) and a health-probe watchdog, so a daemon that stops responding
+            # mid-run is caught within a few poll intervals instead of only once the full timeout fires.
+            done, _ = await asyncio.wait(
+                {post_task, wedge_task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+            )
+
+            # A 2xx reply means the run finished, so it is never discarded as a wedge — but an
+            # exception is not a reply (a read timeout is a wedge symptom).
+            post_ok = (
+                post_task in done
+                and post_task.exception() is None
+                and post_task.result().is_success
+            )
+            wedged = not post_ok and (wedge_task in done or not (await server.is_responsive()))
+            if wedged:
+                # The daemon is gone, so cleaning the session up on it would only time out too.
+                skip_cleanup = True
+                return _cut_short_result(
+                    watcher, _elapsed_ms(t0), session_id, end=SessionEnd.WEDGED, returncode=None
+                )
+
+            timed_out = post_task not in done or isinstance(
+                post_task.exception(), httpx.TimeoutException
+            )
+            if timed_out:
+                # Abort so the daemon stops spending, then report the timeout with the partial cost
+                # the watcher gathered (an empty result would under-count overruns).
+                with contextlib.suppress(httpx.HTTPError, RuntimeError):
+                    await client.post(f"{base_url}/session/{session_id}/abort", json={})
+                return _cut_short_result(
+                    watcher, _elapsed_ms(t0), session_id, end=SessionEnd.TIMED_OUT, returncode=None
+                )
+            message = post_task.result()
+            message.raise_for_status()
+            message_json = message.json()
+        except (httpx.HTTPError, RuntimeError, ValueError) as e:
+            # In flight and possibly already charged, so terminal — never retried into a silent
+            # re-run (ValueError covers a reply body that won't decode). But an intentional cap abort
+            # can also surface here; if the watcher already classified the run, that stands, so fall
+            # through to its result.
+            if not (watcher.budget_exceeded or watcher.turns_exceeded):
+                return _cut_short_result(
+                    watcher,
+                    _elapsed_ms(t0),
+                    session_id,
+                    end=SessionEnd.TRANSPORT_LOST,
+                    returncode=1,
+                    error=str(e)[:500],
+                )
+        finally:
+            # Whichever of the two finished first, the other is now stale and must not hold the
+            # message response open.
+            for task in (post_task, wedge_task):
+                if not task.done():
+                    task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+
+        # Let the watcher fold in the final step-finish (and the idle marker) before reading it.
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(watcher.idle.wait(), _IDLE_DRAIN_TIMEOUT)
+        if watcher.wrap_up_reason is not None:
+            logger.info(
+                "session %s ended after a wrap-up: spend $%.4f at wrap-up, $%.4f at the end",
+                session_id,
+                watcher.cost_at_wrap_up,
+                watcher.cost,
+            )
+        # No steps seen means the stream delivered nothing, so the live cost sum is empty; read the
+        # session's own aggregate instead of the final message's last-step-only cost.
+        fallback_cost = None
+        if not watcher.saw_steps:
+            fallback_cost = await _session_total_cost(client, base_url, session_id)
+        return _to_driver_result(
+            message_json,
+            watcher,
+            duration_ms=_elapsed_ms(t0),
+            session_id=session_id,
+            fallback_cost=fallback_cost,
+        )
+    finally:
+        # Deregister the watcher and delete the session so a long run's shared daemon doesn't
+        # accumulate either. Best-effort: a failure here must never mask the run's result.
+        if session_id is not None and not skip_cleanup:
+            server.remove_watcher(session_id)
+            with contextlib.suppress(Exception):
+                await client.delete(f"{base_url}/session/{session_id}")
+
+
+# ---------------------------------------------------------------------------
+# Request building
+# ---------------------------------------------------------------------------
 
 
 def to_permission_ruleset(spec: PermissionSpec, tools: list[str], cwd: str) -> list[dict[str, str]]:
@@ -119,172 +299,49 @@ def build_message_body(
     if response_model is not None:
         body["format"] = {
             "type": "json_schema",
-            "schema": response_model.model_json_schema(),
+            "schema": format_schema(response_model, provider),
             "retryCount": _STRUCTURED_RETRY_COUNT,
         }
     return body
 
 
-# Event stream envelope. The daemon-global SSE stream carries one JSON object per ``data:`` line; a
-# part update wraps a step/tool/text part, and an idle event marks the run complete.
-_PART_EVENT = "message.part.updated"
-_IDLE_EVENT = "session.idle"
-# serve names part types with hyphens; the timeline uses underscores. A type absent here is dropped.
-_PART_TYPE_MAP: dict[str, str] = {
-    "step-start": "step_start",
-    "step-finish": "step_finish",
-    "tool": "tool_use",
-    "text": "text",
-}
-
-# A sink for live per-event updates as a run works: assistant-text deltas (``{"kind": "token",
-# "text": …}``) and tool-call state transitions (``{"kind": "tool", "id", "name", "status",
-# "input"?, "output"?}``). Invoked synchronously as events arrive so a caller can stream progress.
-# Best-effort — a sink that raises is logged and swallowed so it can never disturb cap enforcement.
-EventSink = Callable[[dict[str, Any]], None]
+# ---------------------------------------------------------------------------
+# Wedge watchdog and result mapping
+# ---------------------------------------------------------------------------
 
 
-class _SessionWatcher:
-    """Track one session's cost, turns, and timeline from the event stream, flagging when a budget or
-    turn cap is crossed.
+async def _wait_for_wedge(server: OpencodeServer) -> None:
+    """Return once the daemon has failed health probes ``_WEDGE_POLL_MISSES`` times in a row."""
+    misses = 0
+    while True:
+        await asyncio.sleep(_WEDGE_POLL_INTERVAL)
+        if await server.is_responsive():
+            misses = 0
+        else:
+            misses += 1
+            if misses >= _WEDGE_POLL_MISSES:
+                return
 
-    Each step-finish adds its cost and one turn; the first crossing flags the run and signals an abort.
-    The watcher stays pure — the caller does the aborting — so the accounting is testable offline.
-    """
 
-    def __init__(
-        self,
-        session_id: str,
-        max_budget_usd: float | None,
-        max_turns: int | None,
-        event_sink: EventSink | None = None,
-    ) -> None:
-        self.session_id = session_id
-        self._budget = max_budget_usd
-        self._max_turns = max_turns
-        self.cost = 0.0
-        self.turns = 0
-        self.budget_exceeded = False
-        self.turns_exceeded = False
-        # Timeline part snapshots keyed by opencode's stable part id, latest kept: opencode re-sends a
-        # full snapshot on every update (a bash tool re-emits its whole output per stdout chunk), so
-        # keying by id collapses the hundreds of snapshots per part to one. First-seen order is kept.
-        self._parts: dict[str, dict[str, Any]] = {}
-        self._anon_seq = 0  # synthetic keys for a part with no id, so those are never merged
-        self.idle = asyncio.Event()
-        # Live-update sink plus the per-part state that keeps its stream free of the snapshot spam:
-        # how many chars of each text part were already emitted (so only the new tail is sent) and the
-        # last tool status emitted per part (so each transition, not every republished snapshot, fires).
-        self._event_sink = event_sink
-        self._emitted_text: dict[str, int] = {}
-        self._emitted_tool_status: dict[str, str] = {}
-        # Message ids that opened a generation step. opencode also re-emits the user's own prompt as a
-        # text part (with no step), so text is streamed only for messages seen here — the assistant's,
-        # not the echoed prompt.
-        self._generating_messages: set[str] = set()
-
-    @property
-    def part_snapshots(self) -> list[dict[str, Any]]:
-        """The latest snapshot of each part, in first-seen order, for the timeline."""
-        return list(self._parts.values())
-
-    def process(self, event: dict[str, Any]) -> bool:
-        """Fold one event into the running state; return True when the run should be aborted now."""
-        etype = event.get("type")
-        if etype == _IDLE_EVENT:
-            self.idle.set()
-            return False
-        if etype != _PART_EVENT:
-            return False
-        part = (event.get("properties") or {}).get("part") or {}
-        run_type = _PART_TYPE_MAP.get(part.get("type", ""))
-        if run_type is not None:
-            part_id = part.get("id")
-            if not isinstance(part_id, str):
-                part_id = f"_anon{self._anon_seq}"
-                self._anon_seq += 1
-            # opencode's step parts carry no timestamp, so stamp arrival time for the trace timeline.
-            self._parts[part_id] = {
-                "type": run_type,
-                "part": part,
-                "timestamp": int(time.time() * 1000),
-            }
-            if run_type in ("step_start", "step_finish"):
-                message_id = part.get("messageID")
-                if isinstance(message_id, str):
-                    self._generating_messages.add(message_id)
-            self._emit_live(part_id, run_type, part)
-        if part.get("type") != "step-finish":
-            return False
-        self.turns += 1
-        cost = part.get("cost")
-        if isinstance(cost, (int, float)):
-            self.cost += cost
-        if self.budget_exceeded or self.turns_exceeded:
-            return False
-        if self._budget is not None and self.cost >= self._budget:
-            self.budget_exceeded = True
-            return True
-        if self._max_turns is not None and self.turns >= self._max_turns:
-            self.turns_exceeded = True
-            return True
-        return False
-
-    def _emit_live(self, part_id: str, run_type: str, part: dict[str, Any]) -> None:
-        """Push a live update — a text delta or a tool-call transition — to the sink, if one is set.
-        Best-effort: a failing sink is logged and swallowed so it can't disturb cap enforcement."""
-        if self._event_sink is None:
-            return
-        event = self._live_event(part_id, run_type, part)
-        if event is None:
-            return
-        try:
-            self._event_sink(event)
-        except Exception as e:
-            logger.debug("live event sink raised; dropping update: %s", e)
-
-    def _live_event(
-        self, part_id: str, run_type: str, part: dict[str, Any]
-    ) -> dict[str, Any] | None:
-        """Normalize a part update into a live event, or None when it carries nothing new.
-
-        A text part yields only its newly-appended tail — opencode resends the whole text on every
-        update, so the delta against what was already emitted is sent — and only for an assistant
-        message, so the prompt opencode echoes back as a text part is not restreamed as output. A
-        tool part yields one event per status transition (pending → running → completed), carrying
-        the call's input and, once it finishes, its output; the repeated same-status snapshots in
-        between are dropped.
-        """
-        if run_type == "text":
-            if part.get("messageID") not in self._generating_messages:
-                return None
-            full = part.get("text")
-            if not isinstance(full, str):
-                return None
-            seen = self._emitted_text.get(part_id, 0)
-            if len(full) <= seen:
-                return None
-            self._emitted_text[part_id] = len(full)
-            return {"kind": "token", "text": full[seen:]}
-        if run_type == "tool_use":
-            state = part.get("state")
-            state = state if isinstance(state, dict) else {}
-            status = state.get("status")
-            if not isinstance(status, str) or self._emitted_tool_status.get(part_id) == status:
-                return None
-            self._emitted_tool_status[part_id] = status
-            event: dict[str, Any] = {
-                "kind": "tool",
-                "id": part_id,
-                "name": part.get("tool", "?"),
-                "status": status,
-            }
-            if state.get("input") is not None:
-                event["input"] = state["input"]
-            if state.get("output") is not None:
-                event["output"] = state["output"]
-            return event
-        return None
+def _cut_short_result(
+    watcher: SessionWatcher,
+    duration_ms: int,
+    session_id: str,
+    *,
+    end: SessionEnd,
+    returncode: int | None,
+    error: str | None = None,
+) -> DriverResult:
+    """A session that ended before its reply, reported with the spend and steps it did make."""
+    return DriverResult(
+        parsed=ParsedRun(error=error, cost_usd=watcher.cost, num_turns=watcher.turns),
+        returncode=returncode,
+        duration_ms=duration_ms,
+        end=end,
+        subagent_cost_usd=watcher.subagent_cost,
+        session_id=session_id,
+        wrap_up_reason=watcher.wrap_up_reason,
+    )
 
 
 async def _session_total_cost(
@@ -304,13 +361,14 @@ async def _session_total_cost(
 
 def _to_driver_result(
     final_message: dict[str, Any],
-    watcher: _SessionWatcher,
+    watcher: SessionWatcher,
     duration_ms: int,
+    session_id: str,
     fallback_cost: float | None = None,
 ) -> DriverResult:
     """Map the prompt response and the watched stream onto a DriverResult.
 
-    The watcher supplies cost, turns, and timeline whenever it saw any steps. If it saw none, the
+    The watcher supplies cost and turns whenever it saw any steps. If it saw none, the
     session's own aggregate is used when available, since the final message reports only its last
     step's cost.
     """
@@ -321,137 +379,42 @@ def _to_driver_result(
     # error. That is expected, not a failure, so drop it and let the cap flags classify the result.
     aborted = watcher.budget_exceeded or watcher.turns_exceeded
     error = None if aborted else info.get("error")
-    if watcher.turns:
+    if watcher.saw_steps:
         cost, turns = watcher.cost, watcher.turns
+        session_total = False
     else:
+        session_total = fallback_cost is not None
         cost = fallback_cost if fallback_cost is not None else float(info.get("cost") or 0.0)
         turns = sum(1 for p in parts if p.get("type") == "step-finish")
+    finish = info.get("finish")
     parsed = ParsedRun(
         text=text,
         structured=info.get("structured"),
         cost_usd=cost,
         num_turns=turns,
         error=json.dumps(error)[:500] if error else None,
+        finish=finish if isinstance(finish, str) else None,
+        cost_is_session_total=session_total,
+        provider_failed=isinstance(error, dict) and error.get("name") in _PROVIDER_ERROR_NAMES,
     )
     return DriverResult(
         parsed=parsed,
         returncode=0,
         duration_ms=duration_ms,
-        budget_exceeded=watcher.budget_exceeded,
-        turns_exceeded=watcher.turns_exceeded,
-        timeline=build_timeline(watcher.part_snapshots),
+        end=_session_end(watcher),
+        subagent_cost_usd=watcher.subagent_cost,
+        session_id=session_id,
+        wrap_up_reason=watcher.wrap_up_reason,
     )
 
 
-async def run_session(
-    server: OpencodeServer,
-    *,
-    opencode_model: str,
-    system_prompt: str | None,
-    user_message: str,
-    variant: str | None,
-    spec: PermissionSpec,
-    tools: list[str],
-    cwd: str,
-    response_model: type[BaseModel] | None,
-    timeout: float,
-    max_budget_usd: float | None = None,
-    max_turns: int | None = None,
-    event_sink: EventSink | None = None,
-) -> DriverResult:
-    """Run one prompt as a serve session and return the mapped result.
-
-    Spend and steps are tracked live off the daemon's shared event stream, via a watcher registered
-    for this session; crossing the budget or turn cap aborts the session. When ``event_sink`` is
-    given it receives live text deltas and tool-call transitions as they arrive, for streaming a
-    run's progress. Failures before the prompt is sent (caps unenforceable, session create) raise
-    SessionStartError for the runner to retry; once the prompt is in flight, a timeout returns a
-    timed-out result and a transport failure an error result — never a raise, so a charged run is
-    not silently re-run.
-    """
-    base_url = server.base_url
-    client = server.client
-    ruleset = to_permission_ruleset(spec, tools, cwd)
-    t0 = time.monotonic()
-    session_id: str | None = None
-    try:
-        # Caps are enforced off the shared event stream, so a capped run must not proceed while it is
-        # disconnected. It's pre-prompt, so raise for the runner to retry; uncapped runs proceed.
-        if (max_budget_usd is not None or max_turns is not None) and not server.events_ready:
-            raise SessionStartError("event stream unavailable; cap cannot be enforced")
-
-        try:
-            session = await client.post(f"{base_url}/session", json={"permission": ruleset})
-            session.raise_for_status()
-            session_id = str(session.json()["id"])
-        except (httpx.HTTPError, RuntimeError) as e:
-            # Pre-prompt and idempotent (RuntimeError covers the shared client being closed by a
-            # concurrent daemon eviction): raise so the runner retries against a fresh daemon.
-            raise SessionStartError(f"session create failed: {str(e)[:300]}") from e
-
-        # Register before sending the prompt (events for a session only start once the prompt runs),
-        # so the shared consumer routes this session's events to the watcher without a gap.
-        watcher = _SessionWatcher(session_id, max_budget_usd, max_turns, event_sink=event_sink)
-        server.add_watcher(session_id, watcher)
-
-        body = build_message_body(
-            opencode_model=opencode_model,
-            system_prompt=system_prompt,
-            user_message=user_message,
-            variant=variant,
-            response_model=response_model,
-        )
-        message_json: dict[str, Any] = {}
-        try:
-            # asyncio.wait_for caps the whole exchange in wall-clock time. httpx's own timeout only
-            # bounds the gap between response bytes, and the prompt POST blocks silently until the run
-            # finishes, so without this a run that keeps the connection alive could outlast the budget.
-            message = await asyncio.wait_for(
-                client.post(f"{base_url}/session/{session_id}/message", json=body, timeout=timeout),
-                timeout,
-            )
-            message.raise_for_status()
-            message_json = message.json()
-        except (TimeoutError, httpx.TimeoutException):
-            # Wall-clock cap hit: abort so the daemon stops spending, then report the timeout with the
-            # partial cost and timeline the watcher gathered (an empty result would under-count overruns).
-            with contextlib.suppress(httpx.HTTPError, RuntimeError):
-                await client.post(f"{base_url}/session/{session_id}/abort", json={})
-            return DriverResult(
-                parsed=ParsedRun(cost_usd=watcher.cost, num_turns=watcher.turns),
-                returncode=None,
-                duration_ms=_elapsed_ms(t0),
-                timed_out=True,
-                timeline=build_timeline(watcher.part_snapshots),
-            )
-        except (httpx.HTTPError, RuntimeError, ValueError) as e:
-            # In flight and possibly already charged, so terminal — never retried into a silent
-            # re-run (ValueError covers a reply body that won't decode). But an intentional cap abort
-            # can also surface here; if the watcher already classified the run, that stands, so fall
-            # through to its result.
-            if not (watcher.budget_exceeded or watcher.turns_exceeded):
-                return DriverResult(
-                    parsed=ParsedRun(error=str(e)[:500]), returncode=1, duration_ms=_elapsed_ms(t0)
-                )
-
-        # Let the watcher fold in the final step-finish (and the idle marker) before reading it.
-        with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(watcher.idle.wait(), _IDLE_DRAIN_TIMEOUT)
-        # No steps seen means the stream delivered nothing, so the live cost sum is empty; read the
-        # session's own aggregate instead of the final message's last-step-only cost.
-        fallback_cost = None
-        if watcher.turns == 0:
-            fallback_cost = await _session_total_cost(client, base_url, session_id)
-        return _to_driver_result(
-            message_json, watcher, duration_ms=_elapsed_ms(t0), fallback_cost=fallback_cost
-        )
-    finally:
-        # Deregister the watcher and delete the session so a long run's shared daemon doesn't
-        # accumulate either. Best-effort: a failure here must never mask the run's result.
-        if session_id is not None:
-            server.remove_watcher(session_id)
-            with contextlib.suppress(Exception):
-                await client.delete(f"{base_url}/session/{session_id}")
+def _session_end(watcher: SessionWatcher) -> SessionEnd:
+    """Which cap cut a replying session short — budget first, since it is the one that spends."""
+    if watcher.budget_exceeded:
+        return SessionEnd.OVER_BUDGET
+    if watcher.turns_exceeded:
+        return SessionEnd.TURNS_EXHAUSTED
+    return SessionEnd.REPLIED
 
 
 def _elapsed_ms(t0: float) -> int:

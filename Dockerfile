@@ -4,7 +4,7 @@
 FROM python:3.12-slim
 
 # Pinned opencode version. Bump deliberately, then re-verify a real run before shipping.
-ARG OPENCODE_VERSION=1.17.18
+ARG OPENCODE_VERSION=1.19.3
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -33,9 +33,6 @@ RUN pip install -r requirements.txt
 
 # Application code. Tests, scripts, docs, and secrets are excluded via .dockerignore.
 COPY agent/ ./agent/
-COPY core/ ./core/
-COPY llm/ ./llm/
-COPY config/ ./config/
 COPY pod/ ./pod/
 
 # The pod runs LLM-authored shell commands, so it runs as a non-root user with a writable home for

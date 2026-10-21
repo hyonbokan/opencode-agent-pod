@@ -27,8 +27,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+from agent.logger import logger
 from agent.opencode.providers import CATALOG_KEY_VARS, load_custom_providers
-from core.utils.logger import logger
 
 # Catalog provider segment -> its real upstream and how its key is carried on the wire. The upstream
 # includes the API version segment, because the SDK treats it as part of the base URL and appends

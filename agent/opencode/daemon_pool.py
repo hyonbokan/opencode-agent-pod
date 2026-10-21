@@ -14,10 +14,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 
-from agent.opencode.client import mcp_local_config, register_mcp
+from agent.logger import logger
+from agent.mcp import mcp_local_config, register_mcp, registered_servers
 from agent.opencode.server import OpencodeServer
-from core.tools.mcp import registered_servers
-from core.utils.logger import logger
 
 _daemons: dict[str, OpencodeServer] = {}
 # asyncio.Lock binds to the running loop on first acquire (not at construction), so a module-level
@@ -62,6 +61,19 @@ async def get_opencode_daemon(cwd: str) -> OpencodeServer:
             _daemons[cwd] = daemon
             logger.info("opencode serve daemon ready for %s at %s", cwd, daemon.base_url)
         return daemon
+
+
+async def recycle_opencode_daemon(cwd: str, daemon: OpencodeServer) -> None:
+    """Evict and stop a daemon that stopped serving, so the next acquisition launches a fresh one."""
+    async with _lock:
+        # Identity-checked: concurrent callers hitting the same wedge relaunch it once, not each.
+        if _daemons.get(cwd) is not daemon:
+            return
+        del _daemons[cwd]
+    with contextlib.suppress(Exception):
+        await daemon.stop()
+    # Loud on purpose: recovering silently would hide how often the engine stops serving.
+    logger.warning("opencode serve daemon for %s stopped responding; recycled", cwd)
 
 
 async def stop_opencode_daemon(cwd: str) -> None:

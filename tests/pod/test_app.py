@@ -8,7 +8,7 @@ from dataclasses import replace
 import httpx
 import pytest
 
-from agent.models import OpencodeResult
+from agent.models import OpencodeResult, RunSubtype
 from pod import service
 from pod.app import create_app
 from pod.settings import PodSettings
@@ -103,7 +103,7 @@ async def test_run_streams_sse_and_returns_the_result(monkeypatch):
 
         async def run(self, **kwargs):
             return OpencodeResult(
-                text="the answer", total_cost_usd=0.02, duration_ms=10, subtype="success"
+                text="the answer", total_cost_usd=0.02, duration_ms=10, subtype=RunSubtype.SUCCESS
             )
 
     async def _stop(cwd: str) -> None:

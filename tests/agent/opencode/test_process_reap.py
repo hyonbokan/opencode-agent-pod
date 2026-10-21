@@ -20,7 +20,7 @@ import uuid
 import psutil
 import pytest
 
-from agent.opencode.driver import _reap_by_env_marker, terminate_tree
+from agent.opencode.process import _reap_by_env_marker, terminate_tree
 
 _MARKER = "OPENCODE_POD_REAP_TAG"
 # A sleeper long enough to outlive the test but self-terminating if cleanup ever leaks it.

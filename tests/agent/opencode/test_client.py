@@ -1,9 +1,10 @@
-"""Tests for the serve HTTP driver: the PermissionSpec->ruleset translation, the message body, and
-the response->DriverResult mapping. The daemon is faked with an httpx MockTransport, so the request
+"""Tests for the serve session client: the PermissionSpec->ruleset translation, the message body,
+and the response->DriverResult mapping. The daemon is faked with an httpx MockTransport, so the request
 bodies sent and the result parsing are both asserted without a live server."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import Any, cast
@@ -13,19 +14,20 @@ import pytest
 from pydantic import BaseModel
 
 from agent.errors import SessionStartError
+from agent.mcp import McpServer, mcp_tool_ids
+from agent.opencode import client as client_mod
 from agent.opencode.client import (
-    _SessionWatcher,
+    _to_driver_result,
     build_message_body,
-    mcp_local_config,
-    register_mcp,
     run_session,
     to_permission_ruleset,
 )
-from agent.opencode.driver import build_timeline
+from agent.opencode.providers import format_schema
+from agent.opencode.results import DriverResult, ParsedRun, SessionEnd
 from agent.opencode.server import OpencodeServer
+from agent.opencode.watcher import ROOT_WRAP_UP_TEXT, SessionWatcher, wrap_up_tools
 from agent.permissions import PermissionSpec
 from agent.runner import OpencodeRunner
-from core.tools.mcp import McpServer, mcp_tool_ids
 
 _DEMO_SERVER = McpServer(name="demo", command=("python", "srv.py"), tools=("lookup", "fetch"))
 _DEMO_SERVERS_JSON = json.dumps(
@@ -48,8 +50,8 @@ def test_to_permission_ruleset_flattens_config_preserving_precedence():
     # Scalar tool rules become a "*" pattern; the external-directory guard and unallowed tools deny.
     assert ("external_directory", "*", "deny") in tuples
     assert ("edit", "*", "deny") in tuples
-    # An allowed tool with no refinements gets no rule (defaults to allow), so read never appears.
-    assert not any(perm == "read" for perm, _, _ in tuples)
+    # An allowed tool with no refinements gets one explicit "*" allow.
+    assert [t for t in tuples if t[0] == "read"] == [("read", "*", "allow")]
     # bash is allowed: the broad allow must come before the destructive-command denies (last wins).
     bash = [i for i, (perm, _, _) in enumerate(tuples) if perm == "bash"]
     assert tuples[bash[0]] == ("bash", "*", "allow")
@@ -70,7 +72,7 @@ def test_build_message_body_carries_model_system_variant_and_format():
     assert body["variant"] == "high"
     assert body["parts"] == [{"type": "text", "text": "find bugs"}]
     assert body["format"]["type"] == "json_schema"
-    assert body["format"]["schema"] == _Findings.model_json_schema()
+    assert body["format"]["schema"] == format_schema(_Findings, "openai")
 
 
 def test_build_message_body_omits_optional_fields_when_absent():
@@ -127,57 +129,6 @@ def test_to_permission_ruleset_gates_nothing_when_no_servers_configured(monkeypa
     assert not any(perm.startswith("demo_") for perm, _, _ in tuples)
 
 
-def test_mcp_local_config_builds_local_config_from_server_command():
-    config = mcp_local_config(_DEMO_SERVER)
-    assert config["type"] == "local"
-    assert config["enabled"] is True
-    # The command is the server's declared argv, verbatim — the pod injects nothing.
-    assert config["command"] == ["python", "srv.py"]
-
-
-@pytest.mark.asyncio
-async def test_register_mcp_posts_config_and_returns_status():
-    seen: dict = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["path"] = request.url.path
-        seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json={_DEMO_SERVER.name: {"status": "connected"}})
-
-    client = _mock_client(handler)
-    try:
-        status = await register_mcp(
-            "http://d", _DEMO_SERVER.name, mcp_local_config(_DEMO_SERVER), client=client
-        )
-    finally:
-        await client.aclose()
-
-    assert seen["path"] == "/mcp"
-    assert seen["body"]["name"] == _DEMO_SERVER.name
-    assert seen["body"]["config"]["type"] == "local"
-    assert status[_DEMO_SERVER.name]["status"] == "connected"
-
-
-@pytest.mark.asyncio
-async def test_register_mcp_raises_when_server_fails_to_connect():
-    # The daemon answers 200 even when the server process never comes up; only the carried status
-    # says so. Registration must fail loudly, or every agent would silently run without the tools.
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={_DEMO_SERVER.name: {"status": "failed", "error": "MCP error -32000"}},
-        )
-
-    client = _mock_client(handler)
-    try:
-        with pytest.raises(RuntimeError, match="failed to connect.*-32000"):
-            await register_mcp(
-                "http://d", _DEMO_SERVER.name, mcp_local_config(_DEMO_SERVER), client=client
-            )
-    finally:
-        await client.aclose()
-
-
 def _mock_client(handler) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
@@ -216,18 +167,25 @@ class _FakeServer:
 
     base_url = "http://d"
 
-    def __init__(self, client, *, events=None, events_ready=True):
+    def __init__(self, client, *, events=None, events_ready=True, responsive=True, actions=None):
         self.client = client
         self.events_ready = events_ready
         self._events = events or []
+        self._actions = actions
         self.removed: list[str] = []
+        self._responsive = responsive
 
     def add_watcher(self, _session_id: str, watcher) -> None:
         for event in self._events:  # simulate the shared consumer streaming this session's events
-            watcher.process(event)
+            action = watcher.process(event)
+            if self._actions is not None:
+                self._actions.append(action)
 
     def remove_watcher(self, session_id: str) -> None:
         self.removed.append(session_id)
+
+    async def is_responsive(self) -> bool:
+        return self._responsive
 
 
 _FINAL = {
@@ -236,7 +194,9 @@ _FINAL = {
 }
 
 
-async def _run(handler, *, events=None, events_ready=True, **overrides):
+async def _run(
+    handler, *, events=None, events_ready=True, responsive=True, actions=None, **overrides
+):
     kwargs: dict[str, Any] = {
         "opencode_model": "openai/gpt-5.4-mini",
         "system_prompt": "sys",
@@ -250,7 +210,9 @@ async def _run(handler, *, events=None, events_ready=True, **overrides):
     }
     kwargs.update(overrides)
     client = _mock_client(handler)
-    server = _FakeServer(client, events=events, events_ready=events_ready)
+    server = _FakeServer(
+        client, events=events, events_ready=events_ready, responsive=responsive, actions=actions
+    )
     try:
         return await run_session(cast(OpencodeServer, server), **kwargs)
     finally:
@@ -297,7 +259,8 @@ async def test_run_session_success_aggregates_from_stream_and_sends_expected_bod
     assert result.parsed.cost_usd == pytest.approx(0.005)
     assert result.parsed.num_turns == 2
     assert result.parsed.text == "done"
-    assert len(result.timeline) == 2  # two messageID-grouped steps rebuilt for the trace
+    # The finish reason travels through so the runner can tell a concluded run from a truncated one.
+    assert result.parsed.finish == "tool-calls"
     assert result.returncode == 0
 
     assert isinstance(seen["session"]["permission"], list)
@@ -319,7 +282,7 @@ async def test_run_session_reports_budget_exceeded_from_watcher():
     ]
     result = await _run(_serve_handler(_FINAL, seen), events=events, max_budget_usd=0.004)
 
-    assert result.budget_exceeded is True
+    assert result.end is SessionEnd.OVER_BUDGET
     assert result.parsed.cost_usd == pytest.approx(0.005)
 
 
@@ -332,7 +295,39 @@ async def test_run_session_reports_turn_cap_from_watcher():
     ]
     result = await _run(_serve_handler(_FINAL, seen), events=events, max_turns=1)
 
-    assert result.turns_exceeded is True
+    assert result.end is SessionEnd.TURNS_EXHAUSTED
+
+
+@pytest.mark.asyncio
+async def test_run_session_wrap_up_body_repeats_the_original_with_tools_off():
+    seen: dict = {}
+    actions: list = []
+    events = [_step("sess-1", 0.95)]
+    await _run(
+        _serve_handler(_FINAL, seen),
+        events=events,
+        actions=actions,
+        max_budget_usd=1.0,
+        wrap_up=True,
+    )
+
+    ((session_id, body),) = actions[0].prompts
+    assert session_id == "sess-1"
+    assert body["parts"] == [{"type": "text", "text": ROOT_WRAP_UP_TEXT}]
+    assert body["tools"] == wrap_up_tools()
+    # Everything else matches the original message, so the structured answer stays available.
+    assert {k: v for k, v in body.items() if k not in ("parts", "tools")} == {
+        k: v for k, v in seen["message"].items() if k != "parts"
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_session_sends_no_wrap_up_unless_asked():
+    actions: list = []
+    events = [_step("sess-1", 0.95)]
+    await _run(_serve_handler(_FINAL, {}), events=events, actions=actions, max_budget_usd=1.0)
+
+    assert actions[0].prompts == ()
 
 
 @pytest.mark.asyncio
@@ -350,9 +345,9 @@ async def test_run_session_abort_error_does_not_shadow_cap_classification():
     ]
     result = await _run(_serve_handler(final, seen), events=events, max_turns=1)
 
-    assert result.turns_exceeded is True
+    assert result.end is SessionEnd.TURNS_EXHAUSTED
     assert result.parsed.error is None  # the abort's error is dropped
-    mapped = OpencodeRunner._to_result(result)
+    mapped = OpencodeRunner._to_result(result, expects_structured=False)
     assert mapped.subtype == "max_turns"  # a designed ceiling, not an error
     assert mapped.is_error is False
 
@@ -377,10 +372,13 @@ async def test_run_session_prefers_cap_classification_when_prompt_post_errors():
 
     result = await _run(handler, events=events, max_budget_usd=0.004)
 
-    assert result.budget_exceeded is True
+    assert result.end is SessionEnd.OVER_BUDGET
     assert result.parsed.error is None  # not reclassified as a generic error
     assert result.parsed.cost_usd == pytest.approx(0.005)
-    assert OpencodeRunner._to_result(result).subtype == "error_max_budget_usd"
+    assert (
+        OpencodeRunner._to_result(result, expects_structured=False).subtype
+        == "error_max_budget_usd"
+    )
 
 
 @pytest.mark.asyncio
@@ -397,6 +395,8 @@ async def test_run_session_falls_back_to_final_message_when_stream_is_empty():
     assert result.parsed.cost_usd == pytest.approx(0.0017)
     assert result.parsed.num_turns == 1
     assert result.parsed.structured == {"findings": []}
+    # The final message's own cost covers this run only, so it is safe to add to earlier attempts.
+    assert result.parsed.cost_is_session_total is False
 
 
 @pytest.mark.asyncio
@@ -421,6 +421,9 @@ async def test_run_session_reconciles_cost_from_session_aggregate_when_stream_is
     result = await _run(handler, events=[_idle_event("sess-1")], response_model=None)
 
     assert result.parsed.cost_usd == pytest.approx(0.0091)
+    # Flagged, because on a resumed session that aggregate spans the earlier attempts too and the
+    # runner must not add their cost on top of it.
+    assert result.parsed.cost_is_session_total is True
 
 
 @pytest.mark.asyncio
@@ -431,8 +434,103 @@ async def test_run_session_timeout_is_terminal():
         raise httpx.TimeoutException("read timeout")  # the prompt POST (and best-effort abort)
 
     result = await _run(handler, response_model=None, timeout=1.0)
-    assert result.timed_out is True
+    assert result.end is SessionEnd.TIMED_OUT
     assert result.parsed.structured is None
+
+
+@pytest.mark.asyncio
+async def test_wedged_daemon_is_caught_before_the_full_timeout(monkeypatch):
+    # The daemon accepts the connection but never answers — a hang the prompt POST alone would
+    # only surface once the (here, generously long) session timeout elapses.
+    monkeypatch.setattr(client_mod, "_WEDGE_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(client_mod, "_WEDGE_POLL_MISSES", 1)
+    seen: dict = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session":
+            return httpx.Response(200, json={"id": "sess-1"})
+        if request.url.path.endswith("/abort"):
+            seen["aborted"] = True
+            return httpx.Response(200, json=True)
+        if request.url.path.endswith("/message"):
+            await asyncio.Event().wait()  # never resolves; the watchdog must win the race
+            raise AssertionError("unreachable")
+        if request.method == "DELETE":
+            seen["deleted"] = True
+        return httpx.Response(200, json=True)  # session delete, etc.
+
+    start = time.monotonic()
+    result = await _run(handler, response_model=None, timeout=300.0, responsive=False)
+    elapsed = time.monotonic() - start
+
+    assert result.end is SessionEnd.WEDGED
+    assert "aborted" not in seen  # a proven wedge skips the pointless abort call
+    # The session is what the retry resumes on a fresh daemon, so cleanup must leave it alone.
+    assert "deleted" not in seen
+    assert result.session_id == "sess-1"
+    assert elapsed < 5.0  # nowhere near the 300s session timeout
+    assert result.parsed.structured is None
+
+
+@pytest.mark.asyncio
+async def test_completed_run_is_kept_when_the_health_probe_blips():
+    # The probe only decides runs that did not come back. A reply that arrived is paid for, so a
+    # single missed health check on a busy daemon must not discard it as a wedge and re-run it.
+    events = [
+        _part_event("sess-1", {"type": "text", "text": "done", "messageID": "m1"}),
+        _part_event("sess-1", {"type": "step-finish", "cost": 0.002, "messageID": "m1"}),
+        _idle_event("sess-1"),
+    ]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session":
+            return httpx.Response(200, json={"id": "sess-1"})
+        if request.url.path.endswith("/message"):
+            return httpx.Response(200, json=_FINAL)
+        return httpx.Response(200, json=True)
+
+    result = await _run(handler, events=events, responsive=False)
+
+    assert result.end is SessionEnd.REPLIED
+    assert result.parsed.text == "done"
+
+
+@pytest.mark.asyncio
+async def test_run_session_reports_spend_when_the_daemon_goes_away_mid_prompt():
+    # Recycling a wedged daemon closes the HTTP client every sibling session is posting on. The
+    # spend those siblings already made is real, so it has to come back with the failure.
+    events = [
+        _part_event("sess-1", {"type": "step-start", "messageID": "m1"}),
+        _part_event("sess-1", {"type": "text", "text": "half an answer", "messageID": "m1"}),
+        _part_event("sess-1", {"type": "step-finish", "cost": 0.003, "messageID": "m1"}),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session":
+            return httpx.Response(200, json={"id": "sess-1"})
+        raise RuntimeError("Cannot send a request, as the client has been closed.")
+
+    result = await _run(handler, events=events, response_model=None)
+
+    assert result.parsed.error is not None
+    assert result.parsed.cost_usd == pytest.approx(0.003)
+    assert result.parsed.num_turns == 1
+    assert result.end is SessionEnd.TRANSPORT_LOST
+
+
+@pytest.mark.asyncio
+async def test_daemon_that_went_away_is_not_reported_as_the_agent_failing():
+    lost = DriverResult(
+        parsed=ParsedRun(error="client closed", cost_usd=0.003),
+        returncode=1,
+        duration_ms=1000,
+        end=SessionEnd.TRANSPORT_LOST,
+    )
+    result = OpencodeRunner._to_result(lost, expects_structured=False)
+
+    assert result.subtype == "error_transport"
+    assert result.is_error is True
+    assert result.total_cost_usd == pytest.approx(0.003)
 
 
 @pytest.mark.asyncio
@@ -510,191 +608,58 @@ async def test_run_session_terminal_when_response_body_is_unparseable():
     assert result.parsed.error is not None
 
 
-def _pev(part: dict) -> dict:
-    return {"type": "message.part.updated", "properties": {"sessionID": "s", "part": part}}
+def _step(session_id: str, cost: float, reason: str = "tool-calls", message: str = "m") -> dict:
+    part = {"type": "step-finish", "cost": cost, "reason": reason, "messageID": message}
+    return {"type": "message.part.updated", "properties": {"sessionID": session_id, "part": part}}
 
 
-def test_session_watcher_accumulates_cost_and_caps_budget():
-    w = _SessionWatcher("s", max_budget_usd=0.004, max_turns=None)
-    assert w.process(_pev({"type": "step-finish", "cost": 0.003, "messageID": "m1"})) is False
-    assert w.cost == pytest.approx(0.003)
-    assert w.turns == 1
-    # The second step crosses the budget: it signals an abort and flags the run over-budget.
-    assert w.process(_pev({"type": "step-finish", "cost": 0.002, "messageID": "m2"})) is True
-    assert w.budget_exceeded is True
-    assert w.turns == 2
-    assert len(w.part_snapshots) == 2  # both steps captured for the timeline
-
-
-def test_session_watcher_caps_turns_and_records_idle_and_tools():
-    w = _SessionWatcher("s", max_budget_usd=None, max_turns=2)
-    assert w.process(_pev({"type": "step-finish", "cost": 0.0, "messageID": "m1"})) is False
-    assert w.process(_pev({"type": "step-finish", "cost": 0.0, "messageID": "m2"})) is True
-    assert w.turns_exceeded is True
-
-    # A tool part is captured for the timeline but is not a turn; idle sets the completion flag.
-    w2 = _SessionWatcher("s", max_budget_usd=None, max_turns=None)
-    w2.process(_pev({"type": "tool", "tool": "read", "messageID": "m1"}))
-    assert w2.turns == 0
-    assert len(w2.part_snapshots) == 1
-    w2.process({"type": "session.idle", "properties": {"sessionID": "s"}})
-    assert w2.idle.is_set()
-
-
-def test_session_watcher_dedups_republished_part_snapshots_by_id():
-    # opencode re-emits a full snapshot of a part on every update (a bash tool re-sends its whole
-    # output per stdout chunk). Keying by the stable part id keeps one entry per part, so a chatty
-    # tool costs one timeline entry with the latest output — not hundreds retained in memory.
-    w = _SessionWatcher("s", max_budget_usd=None, max_turns=None)
-    for chunk in ("a", "ab", "abc"):
-        w.process(
-            _pev(
-                {
-                    "type": "tool",
-                    "id": "prt_1",
-                    "tool": "bash",
-                    "messageID": "m1",
-                    "state": {"status": "running", "output": chunk},
-                }
-            )
-        )
-    # A second, distinct part is its own entry.
-    w.process(_pev({"type": "text", "id": "prt_2", "text": "done", "messageID": "m1"}))
-
-    assert len(w.part_snapshots) == 2  # three bash snapshots collapsed to one, plus the text part
-    bash_line = next(line for line in w.part_snapshots if line["part"]["id"] == "prt_1")
-    assert bash_line["part"]["state"]["output"] == "abc"  # the latest snapshot is kept
-
-    # Parts without an id (e.g. the test fixtures) are never merged.
-    w.process(_pev({"type": "step-finish", "cost": 0.0, "messageID": "m2"}))
-    w.process(_pev({"type": "step-finish", "cost": 0.0, "messageID": "m3"}))
-    assert len(w.part_snapshots) == 4
-
-
-def test_watched_steps_carry_timing_into_the_timeline():
-    # Regression: opencode's serve step parts carry no timestamp of their own, so the watcher must
-    # stamp arrival time — without it every rebuilt step's start/end is None and the trace loses all
-    # step timing/ordering. Feed a real step-start/step-finish pair (the serve part shape) and assert
-    # the step comes out timed and ordered, not null.
-    w = _SessionWatcher("s", max_budget_usd=None, max_turns=None)
-    w.process(_pev({"type": "step-start", "id": "prt_1", "messageID": "m1"}))
-    time.sleep(0.005)
-    w.process(_pev({"type": "step-finish", "id": "prt_2", "cost": 0.001, "messageID": "m1"}))
-
-    timeline = build_timeline(w.part_snapshots)
-    assert len(timeline) == 1
-    step = timeline[0]
-    assert step.start_ms is not None
-    assert step.end_ms is not None
-    assert step.end_ms >= step.start_ms
-
-
-def test_session_watcher_streams_token_deltas_and_tool_transitions():
-    # With a sink set, the watcher pushes a live update per real change: a text part yields only its
-    # newly-appended tail (opencode resends the whole text each update), and a tool part yields one
-    # event per status transition carrying input and, once done, output.
-    events: list[dict] = []
-    w = _SessionWatcher("s", max_budget_usd=None, max_turns=None, event_sink=events.append)
-
-    # A generation step opens the assistant message; only then is its text streamed as output.
-    w.process(_pev({"type": "step-start", "id": "s1", "messageID": "m1"}))
-    w.process(_pev({"type": "text", "id": "t1", "text": "Hel", "messageID": "m1"}))
-    w.process(_pev({"type": "text", "id": "t1", "text": "Hello wor", "messageID": "m1"}))
-    w.process(
-        _pev({"type": "text", "id": "t1", "text": "Hello wor", "messageID": "m1"})
-    )  # no new text
-    w.process(_pev({"type": "text", "id": "t1", "text": "Hello world", "messageID": "m1"}))
-
-    tool_running = {"status": "running", "input": {"command": "ls"}}
-    tool_done = {"status": "completed", "input": {"command": "ls"}, "output": "a\nb\n"}
-    w.process(
-        _pev({"type": "tool", "id": "b1", "tool": "bash", "messageID": "m1", "state": tool_running})
-    )
-    w.process(
-        _pev({"type": "tool", "id": "b1", "tool": "bash", "messageID": "m1", "state": tool_running})
-    )  # same status
-    w.process(
-        _pev({"type": "tool", "id": "b1", "tool": "bash", "messageID": "m1", "state": tool_done})
-    )
-
-    # A step-finish is a turn, not a live update, so it never reaches the sink.
-    w.process(_pev({"type": "step-finish", "cost": 0.001, "messageID": "m1"}))
-
-    assert events == [
-        {"kind": "token", "text": "Hel"},
-        {"kind": "token", "text": "lo wor"},
-        {"kind": "token", "text": "ld"},
-        {
-            "kind": "tool",
-            "id": "b1",
-            "name": "bash",
-            "status": "running",
-            "input": {"command": "ls"},
-        },
-        {
-            "kind": "tool",
-            "id": "b1",
-            "name": "bash",
-            "status": "completed",
-            "input": {"command": "ls"},
-            "output": "a\nb\n",
-        },
-    ]
-
-
-def test_session_watcher_does_not_stream_the_echoed_prompt():
-    # opencode re-emits the user's own prompt as a text part with no generation step. That must not
-    # be restreamed as assistant output, or a caller renders its own prompt back as the answer.
-    events: list[dict] = []
-    w = _SessionWatcher("s", max_budget_usd=None, max_turns=None, event_sink=events.append)
-
-    # The echoed prompt arrives first, on a message with no step — dropped.
-    w.process(_pev({"type": "text", "id": "u1", "text": "analyze prefix X", "messageID": "user-m"}))
-    # The assistant then generates: its message opens a step, so its text streams.
-    w.process(_pev({"type": "step-start", "id": "s1", "messageID": "asst-m"}))
-    w.process(_pev({"type": "text", "id": "a1", "text": "Result: ", "messageID": "asst-m"}))
-
-    assert events == [{"kind": "token", "text": "Result: "}]  # only the assistant's text
-
-
-def test_session_watcher_without_a_sink_emits_nothing_extra():
-    # The sink is opt-in: the default watcher still tracks cost/turns/timeline and simply skips the
-    # live-event path, so nothing changes for callers that don't want a live trace.
-    w = _SessionWatcher("s", max_budget_usd=None, max_turns=None)
-    w.process(_pev({"type": "text", "id": "t1", "text": "hi", "messageID": "m1"}))
-    assert w.turns == 0
-    assert len(w.part_snapshots) == 1  # timeline still recorded
-
-
-def test_session_watcher_swallows_a_raising_sink():
-    # A live update is best-effort UX: a sink that raises must never break cap accounting.
-    def boom(_event: dict) -> None:
-        raise RuntimeError("consumer went away")
-
-    w = _SessionWatcher("s", max_budget_usd=0.004, max_turns=None, event_sink=boom)
-    w.process(_pev({"type": "step-start", "id": "s1", "messageID": "m1"}))
-    w.process(
-        _pev({"type": "text", "id": "t1", "text": "hi", "messageID": "m1"})
-    )  # sink raises here
-    assert w.process(_pev({"type": "step-finish", "cost": 0.005, "messageID": "m1"})) is True
-    assert w.budget_exceeded is True  # accounting unaffected by the failing sink
+def test_spend_by_subagents_alone_is_reported_from_the_stream():
+    # Subagents can cross the budget before the root's first step finishes; their spend must still
+    # be the run's cost, not the root session's own near-empty aggregate.
+    w = SessionWatcher("s", max_budget_usd=0.03, max_turns=None)
+    w.process(_step("child", 0.02))
+    w.process(_step("child", 0.015))
+    parsed = _to_driver_result({}, w, duration_ms=1, session_id="s", fallback_cost=None).parsed
+    assert parsed.cost_usd == pytest.approx(0.035)
+    assert parsed.num_turns == 0
 
 
 def test_driver_result_feeds_existing_result_mapping():
     # The serve DriverResult must classify through the same _to_result the run driver uses.
-    from agent.opencode.driver import DriverResult, ParsedRun
-
     success = DriverResult(
-        parsed=ParsedRun(text="ok", structured={"findings": []}, cost_usd=0.02, num_turns=3),
+        parsed=ParsedRun(
+            text="ok", structured={"findings": []}, cost_usd=0.02, num_turns=3, finish="tool-calls"
+        ),
         returncode=0,
         duration_ms=1200,
     )
-    mapped = OpencodeRunner._to_result(success)
+    mapped = OpencodeRunner._to_result(success, expects_structured=True)
     assert mapped.is_error is False
     assert mapped.subtype == "success"
     assert mapped.total_cost_usd == 0.02
     assert mapped.num_turns == 3
     assert mapped.structured_output == {"findings": []}
 
-    timed_out = DriverResult(parsed=ParsedRun(), returncode=None, duration_ms=1000, timed_out=True)
-    assert OpencodeRunner._to_result(timed_out).subtype == "error_timeout"
+    timed_out = DriverResult(
+        parsed=ParsedRun(), returncode=None, duration_ms=1000, end=SessionEnd.TIMED_OUT
+    )
+    assert OpencodeRunner._to_result(timed_out, expects_structured=False).subtype == "error_timeout"
+
+
+@pytest.mark.parametrize(
+    ("error", "provider_failed"),
+    [
+        ({"name": "APIError", "data": {"message": "Overloaded", "statusCode": 529}}, True),
+        ({"name": "ProviderAuthError", "data": {"providerID": "anthropic", "message": "x"}}, True),
+        ({"name": "MessageOutputLengthError", "data": {}}, False),
+        ({"name": "ContextOverflowError", "data": {"message": "too long"}}, False),
+        ("aborted", False),
+        (None, False),
+    ],
+)
+def test_only_a_provider_error_in_the_final_message_flags_the_provider(error, provider_failed):
+    w = SessionWatcher("s", max_budget_usd=None, max_turns=None)
+    final = {"info": {"error": error}, "parts": []}
+    parsed = _to_driver_result(final, w, duration_ms=1, session_id="s").parsed
+    assert parsed.provider_failed is provider_failed
+    assert (parsed.error is not None) is (error is not None)

@@ -27,7 +27,7 @@ from urllib.parse import unquote, urlparse
 
 import httpx
 
-from core.utils.logger import logger
+from agent.logger import logger
 from pod.schema import Workspace
 from pod.settings import PodSettings, load_settings
 

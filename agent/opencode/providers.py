@@ -7,6 +7,7 @@ matching key into the variable opencode looks for. New providers are added as a 
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -15,9 +16,9 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from llm import ReasoningEffort
-from llm.models import get_provider_for_model, supports_xhigh_effort
-from llm.types import Provider
+from agent.logger import logger
+from agent.models import ReasoningEffort
+from agent.opencode.catalog import Provider, get_provider_for_model, supports_xhigh_effort
 
 # Our provider enum -> opencode's provider segment. Key injection is handled separately by
 # build_daemon_env (via _KEY_ALIAS), so only the opencode name is needed here.
@@ -58,6 +59,10 @@ CATALOG_KEY_VARS: dict[str, tuple[str, ...]] = {
 _PROVIDER_KEY_VARS: tuple[str, ...] = tuple(
     dict.fromkeys(var for vars_ in CATALOG_KEY_VARS.values() for var in vars_)
 )
+
+# The HTTP service's own settings, its bearer token among them. The daemon needs none of them, and
+# every shell command it spawns would inherit them.
+_SERVICE_SETTINGS_PREFIX = "AGENT_POD_"
 
 
 class CustomProvider(BaseModel):
@@ -124,7 +129,9 @@ def _strip_openai_snapshot(provider: str, model_id: str) -> str:
     return _OPENAI_SNAPSHOT_DATE.sub("", model_id) if provider == "openai" else model_id
 
 
-def to_opencode_variant(effort: ReasoningEffort | None, opencode_model: str) -> str | None:
+def to_opencode_variant(
+    effort: ReasoningEffort | None, opencode_model: str, structured_output: bool = False
+) -> str | None:
     """Return the opencode ``--variant`` for a reasoning effort on a model, or None for the default.
 
     opencode selects reasoning effort through a per-model variant. Anthropic exposes only ``high``
@@ -133,13 +140,17 @@ def to_opencode_variant(effort: ReasoningEffort | None, opencode_model: str) -> 
     effort the model accepts — ``xhigh`` on the OpenAI models that offer it, otherwise ``high`` —
     because a variant a catalog model does not recognize is silently ignored rather than rejected.
     Custom (non-catalog) providers get no variant: we don't know their effort support, and a strict
-    OpenAI-compatible endpoint may reject an unexpected parameter rather than ignore it.
+    OpenAI-compatible endpoint may reject an unexpected parameter rather than ignore it. A
+    structured-output run on Anthropic gets no variant either, since thinking there can leave the
+    structured answer empty.
     """
     if effort is None:
         return None
     if provider_of(opencode_model) not in _CATALOG_PROVIDERS:
         return None
     if provider_of(opencode_model) == "anthropic":
+        if structured_output:
+            return None
         # opencode has no low/medium variants for Anthropic models
         return {ReasoningEffort.HIGH: "high", ReasoningEffort.MAX: "max"}.get(effort)
     if effort is ReasoningEffort.MAX:
@@ -174,6 +185,80 @@ def provider_of(opencode_model: str) -> str:
     return opencode_model.split("/", 1)[0]
 
 
+def _inline_defs(schema: dict[str, Any]) -> dict[str, Any]:
+    """Return the schema with every ``$ref``/``$defs`` inlined and ``$defs`` dropped.
+
+    opencode's Gemini responseSchema conversion drops a ``$ref`` sitting inside array items, so a
+    nested object array comes back filled with scalar placeholders; a fully inlined schema round-
+    trips. Raises ValueError on a recursive schema, which has no finite inlining.
+    """
+    defs = schema.get("$defs", {})
+
+    def resolve(node: Any, seen: tuple[str, ...]) -> Any:
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str):
+                name = ref.rsplit("/", 1)[-1]
+                if name in seen:
+                    raise ValueError(f"recursive $ref {name!r} cannot be inlined")
+                if name not in defs:
+                    raise ValueError(f"unresolved $ref {ref!r}")
+                resolved = resolve(defs[name], (*seen, name))
+                # Field-level siblings (e.g. description) override the shared definition's.
+                siblings = {k: resolve(v, seen) for k, v in node.items() if k != "$ref"}
+                return {**resolved, **siblings} if siblings else resolved
+            return {k: resolve(v, seen) for k, v in node.items() if k != "$defs"}
+        if isinstance(node, list):
+            return [resolve(v, seen) for v in node]
+        return node
+
+    return resolve({k: v for k, v in schema.items() if k != "$defs"}, ())
+
+
+_SCHEMA_MAPS = ("properties", "$defs", "definitions", "patternProperties")
+
+
+def _close_objects(node: Any) -> None:
+    """Set ``additionalProperties: false`` on every closed object in a JSON schema, in place.
+
+    Strict decoding requires it on every object. An object that already declares
+    ``additionalProperties`` is an open map and is left as it is.
+    """
+    if isinstance(node, list):
+        for item in node:
+            _close_objects(item)
+        return
+    if not isinstance(node, dict):
+        return
+    if isinstance(node.get("properties"), dict) and "additionalProperties" not in node:
+        node["additionalProperties"] = False
+    for key, value in list(node.items()):
+        if key in _SCHEMA_MAPS and isinstance(value, dict):
+            for sub in value.values():
+                _close_objects(sub)
+        else:
+            _close_objects(value)
+
+
+def format_schema(response_model: type[BaseModel], provider: str) -> dict[str, Any]:
+    """The json_schema opencode should enforce for a response model on a given provider.
+
+    Gemini gets a $ref-inlined schema to work around the responseSchema converter; a schema that
+    can't be inlined (recursive) falls back to the raw one so the run still proceeds. Gemini is also
+    the one provider left open: its converter takes an OpenAPI subset that has no
+    ``additionalProperties``."""
+    # A copy, since a pass-through response model hands back the caller's own dict.
+    schema = copy.deepcopy(response_model.model_json_schema())
+    if provider == "google":
+        try:
+            schema = _inline_defs(schema)
+        except ValueError as e:
+            logger.warning("cannot inline schema for Gemini (%s); sending raw", e)
+        return schema
+    _close_objects(schema)
+    return schema
+
+
 def _proxied_provider_config(env: Mapping[str, str], proxy_url: str) -> dict[str, Any] | None:
     """Build opencode provider config that points every keyed provider at the proxy with a dummy key.
 
@@ -201,10 +286,12 @@ def _build_proxied_daemon_env(env: dict[str, str], proxy_url: str) -> dict[str, 
     through the proxy.
 
     A shell command the daemon spawns inherits this environment, so with the keys gone it cannot read
-    one. An explicit OPENCODE_CONFIG_CONTENT is left untouched.
+    one. That covers each custom provider's key variable and the custom-provider declaration itself,
+    which may carry a literal key. An explicit OPENCODE_CONFIG_CONTENT is left untouched.
     """
     out = dict(env)
-    for var in _PROVIDER_KEY_VARS:
+    custom_key_vars = [p.api_key_env for p in load_custom_providers(env) if p.api_key_env]
+    for var in (*_PROVIDER_KEY_VARS, *custom_key_vars, _CUSTOM_PROVIDERS_ENV):
         out.pop(var, None)
     if not out.get("OPENCODE_CONFIG_CONTENT"):
         config = _proxied_provider_config(env, proxy_url)
@@ -222,9 +309,11 @@ def build_daemon_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
     variable opencode reads is unset but the source key is held (GEMINI_API_KEY →
     GOOGLE_GENERATIVE_AI_API_KEY), a key absent everywhere is left absent rather than blanked, and any
     custom OpenAI-compatible providers declared in AGENT_CUSTOM_PROVIDERS are compiled into
-    OPENCODE_CONFIG_CONTENT. An explicit OPENCODE_CONFIG_CONTENT is left untouched.
+    OPENCODE_CONFIG_CONTENT. An explicit OPENCODE_CONFIG_CONTENT is left untouched. In both modes
+    the HTTP service's ``AGENT_POD_*`` settings, its bearer token among them, are left out.
     """
-    env = dict(base_env if base_env is not None else os.environ)
+    source = base_env if base_env is not None else os.environ
+    env = {k: v for k, v in source.items() if not k.startswith(_SERVICE_SETTINGS_PREFIX)}
     proxy_url = env.get(KEY_PROXY_ENV)
     if proxy_url:
         return _build_proxied_daemon_env(env, proxy_url)

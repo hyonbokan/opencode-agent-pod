@@ -14,11 +14,11 @@ from collections.abc import AsyncGenerator
 
 from pydantic import BaseModel
 
-from agent.models import OpencodeResult
+from agent.logger import logger
+from agent.models import OpencodeResult, ReasoningEffort, RunSubtype
 from agent.opencode.daemon_pool import stop_opencode_daemon
+from agent.permissions import PermissionSpec
 from agent.runner import OpencodeRunner
-from core.utils.logger import logger
-from llm import ReasoningEffort
 from pod.schema import RunRequest, response_model_from_schema
 from pod.settings import PodSettings
 from pod.workspace import WorkspaceError, reap_workspace, stage_workspace
@@ -29,77 +29,6 @@ from pod.workspace import WorkspaceError, reap_workspace, stage_workspace
 # task created here sits outside the request's cancel scope, so it runs to completion regardless.
 # Tracked so the pod can drain them at shutdown before the event loop stops.
 _pending_cleanups: set[asyncio.Task[None]] = set()
-
-
-async def drain_cleanups(timeout: float = 30.0) -> None:
-    """Wait for in-flight run cleanups to finish, so a reap isn't dropped at shutdown."""
-    if not _pending_cleanups:
-        return
-    with contextlib.suppress(TimeoutError):
-        await asyncio.wait_for(asyncio.gather(*_pending_cleanups, return_exceptions=True), timeout)
-
-
-async def _cleanup_run(cwd: str, task: asyncio.Task) -> None:
-    """Cancel the run if still going, then reap its daemon and workspace. Never raises."""
-    if not task.done():
-        task.cancel()
-        with contextlib.suppress(BaseException):
-            await task
-    with contextlib.suppress(Exception):
-        await stop_opencode_daemon(cwd)
-    await reap_workspace(cwd)
-
-
-def _spawn_cleanup(cwd: str, task: asyncio.Task) -> None:
-    """Reap a run's daemon + workspace on a detached task, immune to the request's cancel scope."""
-    cleanup = asyncio.create_task(_cleanup_run(cwd, task))
-    _pending_cleanups.add(cleanup)
-    cleanup.add_done_callback(_pending_cleanups.discard)
-
-
-def resolve_budget(requested: float | None, settings: PodSettings) -> float | None:
-    """The budget a run actually gets: the request's, else the pod default, clamped to the ceiling."""
-    chosen = requested if requested is not None else settings.default_max_budget_usd
-    ceiling = settings.max_budget_usd
-    if ceiling is None:
-        return chosen
-    return ceiling if chosen is None else min(chosen, ceiling)
-
-
-def build_runner(request: RunRequest, settings: PodSettings) -> OpencodeRunner:
-    """Assemble the engine runner for one request. An empty tool list stays empty — a tool-less run,
-    not the engine's default tool set."""
-    response_model = (
-        response_model_from_schema(request.response_schema)
-        if request.response_schema is not None
-        else None
-    )
-    return OpencodeRunner(
-        model=request.model,
-        tools=request.tools,
-        response_model=response_model,
-        max_turns=settings.max_turns,
-        session_timeout=settings.session_timeout,
-        max_budget_usd=resolve_budget(request.max_budget_usd, settings),
-        reasoning_effort=request.reasoning_effort or ReasoningEffort.MEDIUM,
-    )
-
-
-def _sse(event: str, data: dict) -> str:
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
-
-
-def _sse_comment(text: str) -> str:
-    return f": {text}\n\n"
-
-
-def _result_payload(result: OpencodeResult) -> dict:
-    """Serialize the result for the ``done`` event, flattening a pass-through structured-output model
-    into plain JSON so the caller gets its schema's object back, not a model wrapper."""
-    payload = result.model_dump(mode="json")
-    if isinstance(result.structured_output, BaseModel):
-        payload["structured_output"] = result.structured_output.model_dump(mode="json")
-    return payload
 
 
 async def run_events(request: RunRequest, settings: PodSettings) -> AsyncGenerator[str, None]:
@@ -117,7 +46,7 @@ async def run_events(request: RunRequest, settings: PodSettings) -> AsyncGenerat
         cwd = await stage_workspace(request.workspace, settings)
     except WorkspaceError as e:
         logger.warning("workspace staging failed: %s", e)
-        result = OpencodeResult(text=str(e), is_error=True, subtype="error")
+        result = OpencodeResult(text=str(e), is_error=True, subtype=RunSubtype.ERROR)
         yield _sse("cost", {"total_cost_usd": None, "duration_ms": None})
         yield _sse("done", _result_payload(result))
         return
@@ -132,6 +61,9 @@ async def run_events(request: RunRequest, settings: PodSettings) -> AsyncGenerat
             system_prompt=request.system_prompt,
             user_message=request.prompt,
             cwd=cwd,
+            permission=PermissionSpec(
+                write_allow=tuple(request.write_allow), write_deny=tuple(request.write_deny)
+            ),
             event_sink=live_events.put_nowait,
         )
     )
@@ -153,3 +85,80 @@ async def run_events(request: RunRequest, settings: PodSettings) -> AsyncGenerat
 
     yield _sse("cost", {"total_cost_usd": result.total_cost_usd, "duration_ms": result.duration_ms})
     yield _sse("done", _result_payload(result))
+
+
+def build_runner(request: RunRequest, settings: PodSettings) -> OpencodeRunner:
+    """Assemble the engine runner for one request. An empty tool list stays empty — a tool-less run,
+    not the engine's default tool set."""
+    response_model = (
+        response_model_from_schema(request.response_schema)
+        if request.response_schema is not None
+        else None
+    )
+    return OpencodeRunner(
+        model=request.model,
+        tools=request.tools,
+        response_model=response_model,
+        max_turns=settings.max_turns,
+        session_timeout=settings.session_timeout,
+        max_budget_usd=resolve_budget(request.max_budget_usd, settings),
+        reasoning_effort=request.reasoning_effort or ReasoningEffort.MEDIUM,
+        wrap_up=request.wrap_up,
+    )
+
+
+def resolve_budget(requested: float | None, settings: PodSettings) -> float | None:
+    """The budget a run actually gets: the request's, else the pod default, clamped to the ceiling."""
+    chosen = requested if requested is not None else settings.default_max_budget_usd
+    ceiling = settings.max_budget_usd
+    if ceiling is None:
+        return chosen
+    return ceiling if chosen is None else min(chosen, ceiling)
+
+
+async def drain_cleanups(timeout: float = 30.0) -> None:
+    """Wait for in-flight run cleanups to finish, so a reap isn't dropped at shutdown."""
+    if not _pending_cleanups:
+        return
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(asyncio.gather(*_pending_cleanups, return_exceptions=True), timeout)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _spawn_cleanup(cwd: str, task: asyncio.Task) -> None:
+    """Reap a run's daemon + workspace on a detached task, immune to the request's cancel scope."""
+    cleanup = asyncio.create_task(_cleanup_run(cwd, task))
+    _pending_cleanups.add(cleanup)
+    cleanup.add_done_callback(_pending_cleanups.discard)
+
+
+async def _cleanup_run(cwd: str, task: asyncio.Task) -> None:
+    """Cancel the run if still going, then reap its daemon and workspace. Never raises."""
+    if not task.done():
+        task.cancel()
+        with contextlib.suppress(BaseException):
+            await task
+    with contextlib.suppress(Exception):
+        await stop_opencode_daemon(cwd)
+    await reap_workspace(cwd)
+
+
+def _result_payload(result: OpencodeResult) -> dict:
+    """Serialize the result for the ``done`` event, flattening a pass-through structured-output model
+    into plain JSON so the caller gets its schema's object back, not a model wrapper."""
+    payload = result.model_dump(mode="json")
+    if isinstance(result.structured_output, BaseModel):
+        payload["structured_output"] = result.structured_output.model_dump(mode="json")
+    return payload
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def _sse_comment(text: str) -> str:
+    return f": {text}\n\n"

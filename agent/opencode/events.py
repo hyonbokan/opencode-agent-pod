@@ -2,8 +2,9 @@
 
 opencode's ``/event`` stream is daemon-global, so the daemon reads it once and routes each decoded
 event to the registered session's watcher — rather than every run opening its own stream and
-re-decoding the whole firehose. It aborts a session when its watcher flags a cap crossing, and
-reconnects with backoff if the stream drops.
+re-decoding the whole firehose. Events of a subagent session are routed to the run that started it.
+It carries out what a watcher asks for (an abort, or messages to running sessions), and reconnects
+with backoff if the stream drops.
 """
 
 from __future__ import annotations
@@ -11,26 +12,42 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from collections.abc import Coroutine
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
 
-from core.utils.logger import logger
+from agent.logger import logger
 
 # The stream normally opens in well under a second; if it can't within this, the daemon start that
 # awaits it fails and is retried/relaunched rather than serving runs whose caps can't be enforced.
 STREAM_READY_TIMEOUT = 5.0
 _RECONNECT_BACKOFF_START = 0.5
 _RECONNECT_BACKOFF_MAX = 5.0
+_CREATED_EVENT = "session.created"
+
+
+@dataclass(frozen=True)
+class WatchAction:
+    """What a watcher asks the consumer to do after an event: abort its session, and/or post these
+    ``(session_id, body)`` messages to ``prompt_async``."""
+
+    abort: bool = False
+    prompts: tuple[tuple[str, dict[str, Any]], ...] = ()
+
+
+NO_ACTION = WatchAction()
 
 
 class Watcher(Protocol):
-    """The slice of a session watcher the consumer drives: fold one event in, return True to abort."""
+    """The slice of a session watcher the consumer drives: fold one event in, return what to do."""
 
-    def process(self, event: dict[str, Any]) -> bool: ...
+    def process(self, event: dict[str, Any]) -> WatchAction:
+        raise NotImplementedError
 
 
-def _session_id_of(event: dict[str, Any]) -> str | None:
+def session_id_of(event: dict[str, Any]) -> str | None:
     """The sessionID an event belongs to, used to route the daemon-global stream to one run."""
     props = event.get("properties") or {}
     if isinstance(props.get("sessionID"), str):
@@ -43,18 +60,20 @@ class EventConsumer:
     """The daemon's single ``/event`` reader, dispatching decoded events to per-session watchers.
 
     A run registers its watcher with :meth:`add_watcher` before sending its prompt and drops it with
-    :meth:`remove_watcher` when done. Registration/removal never awaits, so under the single-threaded
-    loop no lock is needed.
+    :meth:`remove_watcher` when done. A session created under a registered one (a subagent, at any
+    depth) is aliased to that run's watcher. Registration/removal never awaits, so under the
+    single-threaded loop no lock is needed.
     """
 
     def __init__(self, base_url: str, client: httpx.AsyncClient) -> None:
         self._base_url = base_url
         self._client = client
         self._watchers: dict[str, Watcher] = {}
+        self._subagent_roots: dict[str, str] = {}  # subagent session id -> its run's session id
         self._task: asyncio.Task[None] | None = None
-        # Hold abort tasks so the loop's weak task references don't let them be garbage-collected
-        # mid-flight; the done callback drops each once it settles.
-        self._abort_tasks: set[asyncio.Task[None]] = set()
+        # Hold abort and message tasks so the loop's weak task references don't let them be
+        # garbage-collected mid-flight; the done callback drops each once it settles.
+        self._action_tasks: set[asyncio.Task[None]] = set()
         self._connected = asyncio.Event()
         self._stopping = False
 
@@ -69,6 +88,7 @@ class EventConsumer:
 
     def remove_watcher(self, session_id: str) -> None:
         self._watchers.pop(session_id, None)
+        self._subagent_roots = {k: v for k, v in self._subagent_roots.items() if v != session_id}
 
     async def start(self, ready_timeout: float = STREAM_READY_TIMEOUT) -> None:
         """Open the stream and start dispatching, returning once it is connected. Raises if the stream
@@ -121,17 +141,49 @@ class EventConsumer:
         # shared reader; skip it.
         if not isinstance(event, dict):
             return
-        session_id = _session_id_of(event)
+        if event.get("type") == _CREATED_EVENT:
+            self._alias_subagent(event)
+            return
+        session_id = session_id_of(event)
         if session_id is None:
             return
-        watcher = self._watchers.get(session_id)
-        # process() flags a cap crossing at most once (the watcher latches), so at most one abort task
-        # per session; fire it off the dispatch loop so a slow abort POST can't stall other sessions.
-        if watcher is not None and watcher.process(event):
-            task = asyncio.create_task(self._abort(session_id))
-            self._abort_tasks.add(task)
-            task.add_done_callback(self._abort_tasks.discard)
+        run_id = self._subagent_roots.get(session_id, session_id)
+        watcher = self._watchers.get(run_id)
+        if watcher is None:
+            return
+        self._apply_action(run_id, watcher.process(event))
+
+    def _apply_action(self, run_id: str, action: WatchAction) -> None:
+        # Fire off the dispatch loop so a slow POST can't stall other sessions. A watcher asks for
+        # an abort at most once (it latches), so there is at most one abort task per session.
+        if action.abort:
+            self._spawn(self._abort(run_id))
+        for target, body in action.prompts:
+            self._spawn(self._prompt(target, body))
+
+    def _alias_subagent(self, event: dict[str, Any]) -> None:
+        info = (event.get("properties") or {}).get("info") or {}
+        parent = info.get("parentID")
+        if not isinstance(parent, str) or not isinstance(info.get("id"), str):
+            return
+        run_id = parent if parent in self._watchers else self._subagent_roots.get(parent)
+        if run_id is not None:
+            self._subagent_roots[info["id"]] = run_id
+
+    def _spawn(self, coro: Coroutine[Any, Any, None]) -> None:
+        task = asyncio.create_task(coro)
+        self._action_tasks.add(task)
+        task.add_done_callback(self._action_tasks.discard)
 
     async def _abort(self, session_id: str) -> None:
         with contextlib.suppress(Exception):  # best-effort; must never crash the consumer
             await self._client.post(f"{self._base_url}/session/{session_id}/abort", json={})
+
+    async def _prompt(self, session_id: str, body: dict[str, Any]) -> None:
+        try:
+            resp = await self._client.post(
+                f"{self._base_url}/session/{session_id}/prompt_async", json=body
+            )
+            resp.raise_for_status()
+        except Exception as e:  # best-effort, like an abort
+            logger.warning("opencode message to session %s failed: %s", session_id, e)

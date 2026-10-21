@@ -1,6 +1,6 @@
 """The FastAPI app: a bearer-guarded ``POST /agent/run`` that streams one autonomous run as SSE.
 
-Internal, trusted-network service (DESIGN §11): a shared bearer token gates every run, each run is
+Internal, trusted-network service: a shared bearer token gates every run, each run is
 budget-capped and workspace-isolated, and daemons are drained at shutdown. Not a public endpoint.
 """
 
@@ -14,10 +14,9 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 
+from agent.logger import logger
 from agent.opencode.daemon_pool import shutdown_opencode_daemons
 from agent.opencode.providers import KEY_PROXY_ENV
-from agent.runner import flush_pending_traces
-from core.utils.logger import logger
 from pod.key_proxy import KeyProxy, build_routes
 from pod.schema import RunRequest
 from pod.service import drain_cleanups, run_events
@@ -44,10 +43,9 @@ def create_app(settings: PodSettings | None = None) -> FastAPI:
         try:
             yield
         finally:
-            # Let in-flight run cleanups finish, drain traces, then reap any daemon still pooled,
-            # and only then stop the proxy the daemons were talking to.
+            # Let in-flight run cleanups finish, then reap any daemon still pooled, and only then
+            # stop the proxy the daemons were talking to.
             await drain_cleanups()
-            await flush_pending_traces()
             await shutdown_opencode_daemons()
             if proxy is not None:
                 os.environ.pop(KEY_PROXY_ENV, None)

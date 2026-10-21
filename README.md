@@ -2,7 +2,7 @@
 
 Autonomous [opencode](https://opencode.ai) agents as a deployable HTTP service.
 
-![opencode](https://img.shields.io/badge/opencode-1.17.18-black?style=flat-square)
+![opencode](https://img.shields.io/badge/opencode-1.19.3-black?style=flat-square)
 ![Python](https://img.shields.io/badge/Python-3.12-blue?style=flat-square)
 ![FastAPI](https://img.shields.io/badge/FastAPI-SSE-009688?style=flat-square)
 
@@ -61,8 +61,7 @@ run ends.
 `https://` (and loopback `http://`) pulls over the network so the pod shares no
 filesystem with the caller. Local `file://` / bare paths still work when both share a
 host. Native `s3://` and large-data RO mounts are not built yet. An LLM with `Bash`
-should not share a disk or network with a trusted backend; see
-[DESIGN → Scope](DESIGN.md#scope-prototype-vs-ideal-deployment) and [DEPLOY.md](DEPLOY.md).
+should not share a disk or network with a trusted backend; see [DEPLOY.md](DEPLOY.md).
 
 ## Architecture
 
@@ -138,7 +137,10 @@ sequenceDiagram
   "tools":            ["Read", "Bash", "Write"],             // from the tool registry (empty = plain inference)
   "response_schema":  { "…": "JSON Schema" },                // optional → structured output
   "reasoning_effort": "low|medium|high|max",                 // optional
-  "max_budget_usd":   0.50,                                  // hard per-request breaker (clamped to pod ceiling)
+  "max_budget_usd":   0.50,                                  // hard per-request breaker (clamped to pod ceiling); subagent spend counts
+  "wrap_up":          false,                                 // optional; near a cap, switch tools off and ask for an answer
+  "write_allow":      ["out/**"],                            // optional; only these workspace paths are writable
+  "write_deny":       ["*.env"],                             // optional; never writable, even if write_allow matches
   "workspace":        { "source": "https://…/run-42.tgz", "mode": "ro" } // optional; file:// also ok on a shared host
 }
 ```
@@ -149,6 +151,7 @@ Responds `200 text/event-stream`:
 | -------------- | ------------------------------------------------------------------------ |
 | `token`        | assistant-text delta                                                     |
 | `tool`         | tool call `name` / `status` / `input`, plus `output` when finished       |
+| `retry`        | `reason`: `wedged` (session resumes on a fresh daemon) or `incomplete` (run restarts) |
 | `: keep-alive` | comment line while idle (keeps intermediaries from timing out)           |
 | `cost`         | running spend                                                            |
 | `done`         | terminal `OpencodeResult` (below)                                        |
@@ -159,11 +162,33 @@ The `done` event carries:
 | ------------------- | ---------------------------------------------------------------------------- |
 | `text`              | free-text final answer                                                       |
 | `structured_output` | validated object when a `response_schema` was requested                      |
-| `total_cost_usd`    | aggregate spend                                                              |
+| `total_cost_usd`    | aggregate spend, subagents and retried attempts included                     |
+| `subagent_cost_usd` | the part of `total_cost_usd` spent by subagents                              |
 | `duration_ms`       | wall-clock                                                                   |
-| `num_turns`         | internal agent turns taken                                                   |
-| `subtype`           | `success` / `max_turns` / `error_timeout` / `error_max_budget_usd` / `error` |
+| `num_turns`         | internal agent turns taken (subagent steps not counted)                      |
+| `subtype`           | how the run ended (below)                                                    |
+| `finish`            | the model's final finish reason, as opencode reports it                      |
+| `wrap_up_reason`    | `budget` / `turns` / `time` when `wrap_up` fired, else null                  |
 | `is_error`          | whether the caller should treat the run as failed                            |
+
+`subtype` values:
+
+| subtype                   | meaning                                                                  |
+| ------------------------- | ------------------------------------------------------------------------ |
+| `success`                 | answered                                                                 |
+| `max_turns`               | hit the turn cap; output up to it stands (an error only with no structured answer) |
+| `error_timeout`           | hit the wall-clock cap                                                   |
+| `error_max_budget_usd`    | hit the budget                                                           |
+| `error_incomplete`        | ended without the model concluding (e.g. output-length cut), even after one retry |
+| `error_structured_output` | a `response_schema` run returned no valid object                         |
+| `error_provider`          | the provider failed after opencode's own retries; another model may work |
+| `error_transport`         | the daemon died or wedged mid-run and could not be resumed               |
+| `error_session_start`     | no session could be started                                              |
+| `error`                   | anything else                                                            |
+
+A daemon that stops answering health checks mid-run is detected within about a minute,
+replaced, and the same session is resumed with a continuation nudge (one retry, charged to
+the run's budget).
 
 A run with no `tools` and no `workspace` is plain inference. Add tools and a workspace
 for the agent loop.
@@ -179,7 +204,7 @@ Requires the `opencode` binary on `PATH` (the Docker image pins one) and a provi
 
 ```bash
 # Local (Python 3.12), auto-loads .env
-cp .env.example .env          # set AGENT_POD_TOKEN + a provider key (e.g. ANTHROPIC_API_KEY)
+cp env.example .env           # set AGENT_POD_TOKEN + a provider key (e.g. ANTHROPIC_API_KEY)
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m pod       # serves on :8080
 
@@ -192,6 +217,10 @@ docker run --rm -p 8080:8080 \
   opencode-agent-pod:dev
 ```
 
+No provider key yet? opencode's hosted `*-free` models (e.g. `opencode/mimo-v2.6-flash-free`)
+need none, but that free tier refuses runs that offer the model no tools, or only `Bash`; include
+at least `"tools": ["Read", "Glob"]`. Paid providers have no such rule.
+
 Smoke test:
 
 ```bash
@@ -199,6 +228,69 @@ curl -N -X POST http://localhost:8080/agent/run \
   -H "Authorization: Bearer $AGENT_POD_TOKEN" -H 'Content-Type: application/json' \
   -d '{"model": "anthropic/claude-haiku-4-5-20251001", "prompt": "Say hello."}'
 ```
+
+## Integrate with your service
+
+Your service calls the pod over HTTP; nothing else is shared. Per unit of work:
+
+1. **Stage the workspace** (optional). Upload the files the agent should see as a `.tar.gz`
+   or `.zip` to object storage and pass a pre-signed `https://` URL as `workspace.source`.
+   The pod extracts it into a throwaway directory and deletes it after the run.
+2. **POST one run** with your prompt, the tools it may use, and a `response_schema` if you
+   want JSON back.
+3. **Read the SSE stream.** Relay `token`/`tool` events to your UI if you show progress; the
+   `done` event is the result.
+4. **Act on the result.** Check `is_error` and `subtype`: `error_provider` and
+   `error_transport` are worth retrying (another model, or the same one); `error_timeout`,
+   `error_max_budget_usd` and `max_turns` will hit the same limit again unless you raise it.
+5. **Carry state yourself.** For a follow-up, start a new run and put the earlier
+   `structured_output` (or a summary) in the prompt. The pod keeps nothing between runs.
+
+A minimal Python client (`pip install httpx`):
+
+```python
+import json
+
+import httpx
+
+
+def run_agent(base_url: str, token: str, body: dict) -> dict:
+    """Run one agent task on the pod, printing live text, and return the final result."""
+    headers = {"Authorization": f"Bearer {token}"}
+    with httpx.stream(
+        "POST", f"{base_url}/agent/run", json=body, headers=headers, timeout=None
+    ) as resp:
+        resp.raise_for_status()
+        event = None
+        for line in resp.iter_lines():
+            if line.startswith("event: "):
+                event = line.removeprefix("event: ")
+            elif line.startswith("data: "):
+                data = json.loads(line.removeprefix("data: "))
+                if event == "token":
+                    print(data["text"], end="", flush=True)
+                elif event == "retry":
+                    print(f"\n[pod retrying: {data['reason']}]")
+                elif event == "done":
+                    return data
+    raise RuntimeError("stream ended without a done event")
+
+
+result = run_agent(
+    "http://localhost:8080",
+    "<AGENT_POD_TOKEN>",
+    {
+        "model": "anthropic/claude-haiku-4-5-20251001",
+        "prompt": "List the Python files in the workspace and say what each one does.",
+        "tools": ["Read", "Glob", "Grep"],
+        "workspace": {"source": "https://storage.example.com/presigned/run-42.tgz"},
+        "max_budget_usd": 0.50,
+    },
+)
+print(result["subtype"], result["total_cost_usd"])
+```
+
+Lines starting with `:` are keep-alives and can be ignored.
 
 ## Configuration
 
@@ -235,7 +327,8 @@ holds provider keys.
 | Auth      | Bearer token required; fails closed (503) if unset                                                   |
 | Spend     | Per-request budget clamped to a pod ceiling                                                          |
 | Isolation | Dedicated daemon + ephemeral workspace per request; reaped on completion and on disconnect           |
-| Keys      | Real keys live only in the in-process proxy; the daemon and its `Bash` children see a dummy key      |
+| Tools     | Unlisted tools, `skill`/`question`, writes outside the workspace, and destructive or env-dumping `Bash` commands are denied; `write_allow`/`write_deny` narrow writes further |
+| Keys      | Real keys live only in the in-process proxy; the daemon and its `Bash` children see a dummy key and none of the `AGENT_POD_*` settings (bearer token included) |
 | Egress    | In-process key theft is closed. Blocking workspace exfil to arbitrary hosts needs a deploy-time network allowlist; see [DEPLOY.md](DEPLOY.md) |
 
 Image build, egress `NetworkPolicy`, and scaling notes: [DEPLOY.md](DEPLOY.md).
@@ -251,10 +344,6 @@ The pod itself is domain-free. These are real callers, not dependencies:
   real customs documents, the scripted pipeline escalated 8 valuation criticals to one
   `POST /agent/run` each; the agent resolved all 8 (5 extraction artifacts, 3 real
   under-declarations).
-
-Typical integration: build prompt and schema, stage a workspace (`https://` or local
-`file://`), POST one run per unit of work, relay `token`/`tool` SSE to your UI, and pass
-structured output forward as prior findings.
 
 ## Development
 
@@ -272,18 +361,16 @@ what a "timerange" or "declaration" is, it belongs in a caller.
 
 ```
 opencode-agent-pod/
-├── agent/              # engine: OpencodeRunner, response contract,
-│   └── opencode/       #   daemon lifecycle, client, driver, event/budget caps, provider+key map
+├── agent/              # engine: OpencodeRunner, response contract, MCP registry
+│   └── opencode/       #   session client, watcher (caps, wrap-up), daemon lifecycle, provider+key map
 ├── pod/                # FastAPI + SSE service over the engine
 │   ├── app.py          #   create_app: bearer auth, POST /agent/run, /health, lifespan drain
 │   ├── service.py      #   budget resolution, runner assembly, SSE generator, per-run reap
 │   ├── workspace.py    #   stage workspace-by-reference → ephemeral cwd → reap
 │   ├── key_proxy.py    #   key-injecting reverse proxy: real keys never enter the daemon
 │   └── schema.py       #   RunRequest + JSON-Schema response pass-through
-├── core/tools/mcp.py   # config-driven MCP registry (AGENT_MCP_SERVERS)
-├── llm/                # provider/reasoning types, model resolution, retry config
 ├── tests/              # unit tests
 ├── Dockerfile          # deployable image (pinned opencode + the service)
-├── DESIGN.md           # architecture and scope
+├── env.example         # every setting, with defaults; copy to .env
 └── DEPLOY.md           # deployment + egress hardening
 ```
