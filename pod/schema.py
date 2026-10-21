@@ -38,6 +38,10 @@ class RunRequest(BaseModel):
     # Near the budget, turn cap, or timeout, ask the agent (and its subagents) to stop using tools
     # and answer with what it has, instead of being cut off with no answer.
     wrap_up: bool = False
+    # Workspace-relative globs. When set, only write_allow paths are writable; write_deny paths never
+    # are. Both only narrow what an Edit/Write-enabled run may change.
+    write_allow: list[str] = Field(default_factory=list)
+    write_deny: list[str] = Field(default_factory=list)
     workspace: Workspace | None = None
 
 

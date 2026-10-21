@@ -50,8 +50,8 @@ def test_to_permission_ruleset_flattens_config_preserving_precedence():
     # Scalar tool rules become a "*" pattern; the external-directory guard and unallowed tools deny.
     assert ("external_directory", "*", "deny") in tuples
     assert ("edit", "*", "deny") in tuples
-    # An allowed tool with no refinements gets no rule (defaults to allow), so read never appears.
-    assert not any(perm == "read" for perm, _, _ in tuples)
+    # An allowed tool with no refinements gets one explicit "*" allow.
+    assert [t for t in tuples if t[0] == "read"] == [("read", "*", "allow")]
     # bash is allowed: the broad allow must come before the destructive-command denies (last wins).
     bash = [i for i, (perm, _, _) in enumerate(tuples) if perm == "bash"]
     assert tuples[bash[0]] == ("bash", "*", "allow")

@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from agent.logger import logger
 from agent.models import OpencodeResult, ReasoningEffort, RunSubtype
 from agent.opencode.daemon_pool import stop_opencode_daemon
+from agent.permissions import PermissionSpec
 from agent.runner import OpencodeRunner
 from pod.schema import RunRequest, response_model_from_schema
 from pod.settings import PodSettings
@@ -60,6 +61,9 @@ async def run_events(request: RunRequest, settings: PodSettings) -> AsyncGenerat
             system_prompt=request.system_prompt,
             user_message=request.prompt,
             cwd=cwd,
+            permission=PermissionSpec(
+                write_allow=tuple(request.write_allow), write_deny=tuple(request.write_deny)
+            ),
             event_sink=live_events.put_nowait,
         )
     )

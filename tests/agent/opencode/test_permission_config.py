@@ -6,6 +6,7 @@ opencode's last-match-wins evaluator — the broad rule first, the specific over
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -20,8 +21,9 @@ _ALL = ["Read", "Glob", "Grep", "Bash", "Edit", "Write"]
 
 @pytest.fixture
 def git_root(tmp_path: Path) -> str:
-    """A working directory that is itself a git root, so write-allow globs carry no prefix."""
-    (tmp_path / ".git").mkdir()
+    """A working directory that is a real git root (``git rev-parse`` succeeds), so write-allow globs
+    carry no prefix."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     return str(tmp_path)
 
 
@@ -152,8 +154,10 @@ def test_tool_gating_denies_only_unlisted_tools(git_root):
     assert cfg["bash"] == "deny"
     assert cfg["grep"] == "deny"
     assert cfg["webfetch"] == "deny"
-    assert "read" not in cfg  # an allowed tool carries no deny key
-    assert "glob" not in cfg
+    # An allowed tool carries an explicit allow, so opencode never falls back to its own default (an
+    # ask on a dotenv read hangs a headless run).
+    assert cfg["read"] == "allow"
+    assert cfg["glob"] == "allow"
 
 
 def test_edit_denied_outright_when_not_allowed_even_with_write_spec(git_root):
@@ -168,7 +172,7 @@ def test_lowercase_and_mcp_tool_names_are_handled(git_root):
     cfg = permission_config(PermissionSpec(), ["read", "write", "bash", "demo_lookup"], git_root)
     assert cfg["bash"]["*"] == "allow"
     assert "edit" not in cfg  # write mapped to edit → allowed, no path rules
-    assert "read" not in cfg
+    assert cfg["read"] == "allow"  # allowed tool carries an explicit allow
     assert cfg["grep"] == "deny"  # unlisted built-in still denied
 
 
@@ -179,3 +183,47 @@ def test_skill_and_question_denied_regardless_of_allow_list(git_root):
         cfg = permission_config(PermissionSpec(), tools, git_root)
         assert cfg["skill"] == "deny"
         assert cfg["question"] == "deny"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "env",
+        "env | grep KEY",
+        "cd src && env",
+        "printenv ANTHROPIC_API_KEY",
+        "echo $OPENAI_API_KEY",
+        "echo ${AWS_SECRET_ACCESS_KEY}",
+        "cat /proc/1/environ",
+        "export -p",
+        "declare -x",
+        "set",
+        "python -c 'import os; print(os.environ)'",
+        "node -e 'console.log(process.env)'",
+    ],
+)
+def test_naive_env_dumps_are_denied(git_root, command):
+    bash = permission_config(PermissionSpec(), _ALL, git_root)["bash"]
+    assert _edit_action(bash, command) == "deny"
+
+
+@pytest.mark.parametrize(
+    "command", ["pytest -q", "ls .venv", "cat env.example", "grep -rn Environment src", "set -e"]
+)
+def test_ordinary_commands_stay_allowed(git_root, command):
+    bash = permission_config(PermissionSpec(), _ALL, git_root)["bash"]
+    assert _edit_action(bash, command) == "allow"
+
+
+def test_write_allow_treats_invalid_git_dir_as_non_git(tmp_path):
+    # A `.git` that exists but is not a valid repository (e.g. an archived clone missing refs/):
+    # opencode's `git rev-parse` fails, so it anchors at "/" and checks writes against the
+    # near-absolute path. The allow glob must carry the same full-path prefix, or every write is
+    # denied.
+    project = (tmp_path / "repo").resolve()
+    (project / ".git").mkdir(parents=True)
+    edit = permission_config(PermissionSpec(write_allow=("out/**",)), _ALL, str(project))["edit"]
+    prefix = project.as_posix().lstrip("/")
+    assert f"{prefix}/out/**" in edit
+    assert "out/**" not in edit
+    assert _edit_action(edit, f"{prefix}/out/a.md") == "allow"

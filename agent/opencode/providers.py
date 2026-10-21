@@ -60,6 +60,10 @@ _PROVIDER_KEY_VARS: tuple[str, ...] = tuple(
     dict.fromkeys(var for vars_ in CATALOG_KEY_VARS.values() for var in vars_)
 )
 
+# The HTTP service's own settings, its bearer token among them. The daemon needs none of them, and
+# every shell command it spawns would inherit them.
+_SERVICE_SETTINGS_PREFIX = "AGENT_POD_"
+
 
 class CustomProvider(BaseModel):
     """A custom OpenAI-compatible provider the pod can address — a model served at an arbitrary
@@ -282,10 +286,12 @@ def _build_proxied_daemon_env(env: dict[str, str], proxy_url: str) -> dict[str, 
     through the proxy.
 
     A shell command the daemon spawns inherits this environment, so with the keys gone it cannot read
-    one. An explicit OPENCODE_CONFIG_CONTENT is left untouched.
+    one. That covers each custom provider's key variable and the custom-provider declaration itself,
+    which may carry a literal key. An explicit OPENCODE_CONFIG_CONTENT is left untouched.
     """
     out = dict(env)
-    for var in _PROVIDER_KEY_VARS:
+    custom_key_vars = [p.api_key_env for p in load_custom_providers(env) if p.api_key_env]
+    for var in (*_PROVIDER_KEY_VARS, *custom_key_vars, _CUSTOM_PROVIDERS_ENV):
         out.pop(var, None)
     if not out.get("OPENCODE_CONFIG_CONTENT"):
         config = _proxied_provider_config(env, proxy_url)
@@ -303,9 +309,11 @@ def build_daemon_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
     variable opencode reads is unset but the source key is held (GEMINI_API_KEY →
     GOOGLE_GENERATIVE_AI_API_KEY), a key absent everywhere is left absent rather than blanked, and any
     custom OpenAI-compatible providers declared in AGENT_CUSTOM_PROVIDERS are compiled into
-    OPENCODE_CONFIG_CONTENT. An explicit OPENCODE_CONFIG_CONTENT is left untouched.
+    OPENCODE_CONFIG_CONTENT. An explicit OPENCODE_CONFIG_CONTENT is left untouched. In both modes
+    the HTTP service's ``AGENT_POD_*`` settings, its bearer token among them, are left out.
     """
-    env = dict(base_env if base_env is not None else os.environ)
+    source = base_env if base_env is not None else os.environ
+    env = {k: v for k, v in source.items() if not k.startswith(_SERVICE_SETTINGS_PREFIX)}
     proxy_url = env.get(KEY_PROXY_ENV)
     if proxy_url:
         return _build_proxied_daemon_env(env, proxy_url)

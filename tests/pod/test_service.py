@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from agent.models import OpencodeResult, ReasoningEffort, RunSubtype
+from agent.permissions import PermissionSpec
 from pod import service
 from pod.schema import RunRequest, Workspace, response_model_from_schema
 from pod.settings import PodSettings
@@ -282,3 +283,15 @@ def test_build_runner_threads_wrap_up_and_leaves_it_off_by_default():
     assert service.build_runner(RunRequest(model="m", prompt="p"), _settings())._wrap_up is False
     opted_in = RunRequest(model="m", prompt="p", wrap_up=True)
     assert service.build_runner(opted_in, _settings())._wrap_up is True
+
+
+@pytest.mark.asyncio
+async def test_run_events_hands_the_requests_write_rules_to_the_run(monkeypatch, stops):
+    monkeypatch.setattr(service, "OpencodeRunner", _FakeRunner)
+    req = RunRequest(model="m", prompt="p", write_allow=["out/**"], write_deny=["*.env"])
+
+    _ = [chunk async for chunk in service.run_events(req, _settings())]
+    await service.drain_cleanups()
+
+    spec = _FakeRunner.instances[0].run_kwargs["permission"]
+    assert spec == PermissionSpec(write_allow=("out/**",), write_deny=("*.env",))

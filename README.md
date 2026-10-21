@@ -139,6 +139,8 @@ sequenceDiagram
   "reasoning_effort": "low|medium|high|max",                 // optional
   "max_budget_usd":   0.50,                                  // hard per-request breaker (clamped to pod ceiling); subagent spend counts
   "wrap_up":          false,                                 // optional; near a cap, switch tools off and ask for an answer
+  "write_allow":      ["out/**"],                            // optional; only these workspace paths are writable
+  "write_deny":       ["*.env"],                             // optional; never writable, even if write_allow matches
   "workspace":        { "source": "https://…/run-42.tgz", "mode": "ro" } // optional; file:// also ok on a shared host
 }
 ```
@@ -321,7 +323,8 @@ holds provider keys.
 | Auth      | Bearer token required; fails closed (503) if unset                                                   |
 | Spend     | Per-request budget clamped to a pod ceiling                                                          |
 | Isolation | Dedicated daemon + ephemeral workspace per request; reaped on completion and on disconnect           |
-| Keys      | Real keys live only in the in-process proxy; the daemon and its `Bash` children see a dummy key      |
+| Tools     | Unlisted tools, `skill`/`question`, writes outside the workspace, and destructive or env-dumping `Bash` commands are denied; `write_allow`/`write_deny` narrow writes further |
+| Keys      | Real keys live only in the in-process proxy; the daemon and its `Bash` children see a dummy key and none of the `AGENT_POD_*` settings (bearer token included) |
 | Egress    | In-process key theft is closed. Blocking workspace exfil to arbitrary hosts needs a deploy-time network allowlist; see [DEPLOY.md](DEPLOY.md) |
 
 Image build, egress `NetworkPolicy`, and scaling notes: [DEPLOY.md](DEPLOY.md).

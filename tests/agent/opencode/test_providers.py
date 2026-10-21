@@ -295,3 +295,38 @@ def test_format_schema_leaves_a_pass_through_schema_untouched():
     raw = {"type": "object", "properties": {"a": {"type": "string"}}}
     format_schema(response_model_from_schema(raw), "openai")
     assert "additionalProperties" not in raw
+
+
+@pytest.mark.parametrize("proxied", [True, False])
+def test_build_daemon_env_drops_the_services_own_settings(proxied):
+    # The bearer token would otherwise be one `printenv` away for any shell command the agent runs.
+    base = {"AGENT_POD_TOKEN": "pod-secret", "AGENT_POD_PORT": "8080", "AGENT_MCP_SERVERS": "[]"}
+    if proxied:
+        base["AGENT_KEY_PROXY_URL"] = "http://127.0.0.1:9"
+    env = build_daemon_env(base)
+    assert not any(k.startswith("AGENT_POD_") for k in env)
+    assert env["AGENT_MCP_SERVERS"] == "[]"  # engine settings are not the service's
+
+
+def test_build_daemon_env_strips_custom_provider_keys_through_the_proxy():
+    # The proxy holds a custom provider's key; neither its key variable nor the declaration (which
+    # may carry a literal key) may reach the daemon.
+    declared = json.dumps(
+        [
+            {"name": "vllm", "base_url": "http://h/v1", "models": ["m"], "api_key_env": "VLLM_KEY"},
+            {"name": "other", "base_url": "http://o/v1", "models": ["n"], "api_key": "literal"},
+        ]
+    )
+    env = build_daemon_env(
+        {
+            "AGENT_KEY_PROXY_URL": "http://127.0.0.1:9",
+            "AGENT_CUSTOM_PROVIDERS": declared,
+            "VLLM_KEY": "secret-vllm",
+        }
+    )
+    assert "VLLM_KEY" not in env
+    assert "AGENT_CUSTOM_PROVIDERS" not in env
+    assert "secret-vllm" not in json.dumps(env)
+    assert "literal" not in json.dumps(env)
+    config = json.loads(env["OPENCODE_CONFIG_CONTENT"])["provider"]
+    assert config["vllm"]["options"]["baseURL"] == "http://127.0.0.1:9/vllm"
