@@ -73,7 +73,7 @@ class ProviderRoute:
     """Where one provider's traffic goes and the real key to inject on the way out."""
 
     upstream: str
-    api_key: str
+    api_key: str | None  # None for an upstream that takes no key
     auth: str  # "anthropic" | "google" | "bearer"
 
 
@@ -89,13 +89,15 @@ def build_routes(env: Mapping[str, str]) -> dict[str, ProviderRoute]:
         if key:
             routes[seg] = ProviderRoute(_CATALOG_UPSTREAMS[seg], key, _CATALOG_AUTH[seg])
     for p in load_custom_providers(env):
-        key = (env.get(p.api_key_env) if p.api_key_env else None) or p.api_key or ""
+        key = (env.get(p.api_key_env) if p.api_key_env else None) or p.api_key
         routes[p.name] = ProviderRoute(p.base_url, key, "bearer")
     return routes
 
 
 def _inject_auth(headers: dict[str, str], route: ProviderRoute) -> None:
     """Set the real key on the outbound request in the provider's expected header format."""
+    if route.api_key is None:
+        return
     if route.auth == "anthropic":
         headers["x-api-key"] = route.api_key
         headers.setdefault("anthropic-version", "2023-06-01")

@@ -191,6 +191,26 @@ async def test_dispatch_survives_a_non_object_json_payload():
 
 
 @pytest.mark.asyncio
+async def test_dispatch_survives_an_event_it_cannot_process():
+    # The reader carries cap enforcement for every run on the daemon, so an event that fails to
+    # route or fold in must cost only that event, not the stream.
+    class _Raising:
+        def process(self, event: dict) -> WatchAction:
+            raise AttributeError("'str' object has no attribute 'get'")
+
+    consumer = EventConsumer("http://d", _mock_client(_ok))
+    w = _FakeWatcher()
+    consumer.add_watcher("sess-a", _Raising())
+    consumer.add_watcher("sess-b", w)
+
+    consumer._dispatch(_data(_idle("sess-a")))  # the watcher raises: must not propagate
+    consumer._dispatch(_data({"type": "session.idle", "properties": [1]}))  # unroutable shape
+
+    consumer._dispatch(_data(_idle("sess-b")))
+    assert [e["properties"]["sessionID"] for e in w.seen] == ["sess-b"]
+
+
+@pytest.mark.asyncio
 async def test_start_times_out_when_stream_returns_non_2xx():
     # A non-2xx /event delivers no events, so the consumer must not report itself connected — else a
     # capped run would proceed believing its budget/turn caps are enforced. start() times out instead,

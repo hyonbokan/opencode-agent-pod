@@ -365,8 +365,9 @@ class OpencodeRunner:
         return OpencodeResult(
             text=text,
             is_error=is_error,
-            total_cost_usd=parsed.cost_usd or None,
-            subagent_cost_usd=driver_result.subagent_cost_usd or None,
+            total_cost_usd=parsed.cost_usd,
+            # Subagent spend is part of the total, so it is unknown exactly when the total is.
+            subagent_cost_usd=None if parsed.cost_usd is None else driver_result.subagent_cost_usd,
             duration_ms=driver_result.duration_ms,
             num_turns=parsed.num_turns or None,
             structured_output=parsed.structured,

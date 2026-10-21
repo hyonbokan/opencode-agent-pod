@@ -141,6 +141,14 @@ class EventConsumer:
         # shared reader; skip it.
         if not isinstance(event, dict):
             return
+        # This reader enforces every run's caps, so an event that can't be routed or folded in is
+        # dropped loudly rather than allowed to end the stream.
+        try:
+            self._route(event)
+        except Exception as e:
+            logger.warning("opencode event dropped: %s: %s", type(e).__name__, e)
+
+    def _route(self, event: dict[str, Any]) -> None:
         if event.get("type") == _CREATED_EVENT:
             self._alias_subagent(event)
             return

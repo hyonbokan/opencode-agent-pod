@@ -334,7 +334,11 @@ def _cut_short_result(
 ) -> DriverResult:
     """A session that ended before its reply, reported with the spend and steps it did make."""
     return DriverResult(
-        parsed=ParsedRun(error=error, cost_usd=watcher.cost, num_turns=watcher.turns),
+        parsed=ParsedRun(
+            error=error,
+            cost_usd=watcher.cost if watcher.saw_steps else None,
+            num_turns=watcher.turns,
+        ),
         returncode=returncode,
         duration_ms=duration_ms,
         end=end,
@@ -379,12 +383,16 @@ def _to_driver_result(
     # error. That is expected, not a failure, so drop it and let the cap flags classify the result.
     aborted = watcher.budget_exceeded or watcher.turns_exceeded
     error = None if aborted else info.get("error")
+    cost: float | None
     if watcher.saw_steps:
         cost, turns = watcher.cost, watcher.turns
         session_total = False
     else:
         session_total = fallback_cost is not None
-        cost = fallback_cost if fallback_cost is not None else float(info.get("cost") or 0.0)
+        message_cost = info.get("cost")
+        cost = fallback_cost
+        if cost is None and isinstance(message_cost, (int, float)):
+            cost = float(message_cost)
         turns = sum(1 for p in parts if p.get("type") == "step-finish")
     finish = info.get("finish")
     parsed = ParsedRun(
