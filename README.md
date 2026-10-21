@@ -2,7 +2,7 @@
 
 Autonomous [opencode](https://opencode.ai) agents as a deployable HTTP service.
 
-![opencode](https://img.shields.io/badge/opencode-1.17.18-black?style=flat-square)
+![opencode](https://img.shields.io/badge/opencode-1.19.3-black?style=flat-square)
 ![Python](https://img.shields.io/badge/Python-3.12-blue?style=flat-square)
 ![FastAPI](https://img.shields.io/badge/FastAPI-SSE-009688?style=flat-square)
 
@@ -216,6 +216,10 @@ docker run --rm -p 8080:8080 \
   -e AGENT_POD_TOKEN=$POD_TOKEN -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
   opencode-agent-pod:dev
 ```
+
+No provider key yet? opencode's hosted `*-free` models (e.g. `opencode/mimo-v2.6-flash-free`)
+need none, but that free tier refuses runs that offer the model no tools, or only `Bash`; include
+at least `"tools": ["Read", "Glob"]`. Paid providers have no such rule.
 
 Smoke test:
 
