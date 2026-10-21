@@ -63,13 +63,14 @@ ENV_DUMP_BASH_GLOBS: tuple[str, ...] = (
     "*_SECRET*",
 )
 
-# Map a caller's tool name to opencode's permission key, lower-casing so both PascalCase ("Read")
-# and opencode's own lower-case ("read") resolve. edit, write, and patch share the "edit" key.
-_TOOL_TO_PERMISSION: dict[str, str] = {
+# opencode's built-in tools by tool id, each with the permission key that gates it; edit, write, and
+# apply_patch share the "edit" key. Recheck this when bumping opencode: a built-in missing here is
+# neither gated by the allow-list nor switched off by a wrap-up.
+BUILTIN_TOOL_PERMISSIONS: dict[str, str] = {
     "read": "read",
     "edit": "edit",
     "write": "edit",
-    "patch": "edit",
+    "apply_patch": "edit",
     "glob": "glob",
     "grep": "grep",
     "bash": "bash",
@@ -78,20 +79,26 @@ _TOOL_TO_PERMISSION: dict[str, str] = {
     "websearch": "websearch",
     "list": "list",
     "todowrite": "todowrite",
+    "skill": "skill",
+    "question": "question",
 }
 
-# Built-in tools denied when the allow-list omits them, derived from the map above so a new row can't
-# leave a gap. MCP tools aren't here — they have no permission key and are gated by server
-# registration plus the MCP-tool denies added to the session ruleset. `skill` and `question` have
-# no caller-facing tool name but opencode exposes both by default, and neither is safe in a headless
-# run: skill auto-loads external instructions the agent spends its turns on, and question blocks the
-# run waiting for an answer no one gives until the session wall. Both are gated so they are always
-# denied.
-_GATED_PERMISSIONS: tuple[str, ...] = (
-    *dict.fromkeys(_TOOL_TO_PERMISSION.values()),
-    "skill",
-    "question",
-)
+# Built-ins no allow-list can enable, as neither is safe in a headless run: skill auto-loads external
+# instructions the agent spends its turns on, and question blocks the run waiting for an answer no
+# one gives until the session wall.
+_NEVER_ALLOWED = frozenset({"skill", "question"})
+
+# A caller's tool name to its permission key, matched lower-cased so both PascalCase ("Read") and
+# opencode's own ids ("read") resolve; "patch" is kept as a caller-facing alias of apply_patch.
+_TOOL_TO_PERMISSION: dict[str, str] = {
+    **{tool: key for tool, key in BUILTIN_TOOL_PERMISSIONS.items() if key not in _NEVER_ALLOWED},
+    "patch": "edit",
+}
+
+# Permission keys denied when the allow-list omits them. MCP tools aren't here — they have no
+# permission key and are gated by server registration plus the MCP-tool denies added to the session
+# ruleset.
+_GATED_PERMISSIONS: tuple[str, ...] = tuple(dict.fromkeys(BUILTIN_TOOL_PERMISSIONS.values()))
 
 
 def _allowed_permission_keys(tools: list[str]) -> set[str]:

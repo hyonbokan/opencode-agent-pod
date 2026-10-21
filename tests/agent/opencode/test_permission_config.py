@@ -176,6 +176,12 @@ def test_lowercase_and_mcp_tool_names_are_handled(git_root):
     assert cfg["grep"] == "deny"  # unlisted built-in still denied
 
 
+def test_apply_patch_and_its_patch_alias_enable_edit(git_root):
+    for tool in ("apply_patch", "patch"):
+        cfg = permission_config(PermissionSpec(), ["Read", tool], git_root)
+        assert "edit" not in cfg  # allowed, no path rules
+
+
 def test_skill_and_question_denied_regardless_of_allow_list(git_root):
     # Neither maps to a caller-facing tool, so no allow-list can enable them; both are unsafe in a
     # headless run (skill auto-loads external instructions, question blocks on an answer no one gives).
