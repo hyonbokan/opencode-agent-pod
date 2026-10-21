@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import socket
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 
@@ -29,6 +28,7 @@ from starlette.routing import Route
 
 from agent.logger import logger
 from agent.opencode.providers import CATALOG_PROVIDERS, load_custom_providers
+from agent.opencode.server import free_port
 
 # Hop-by-hop headers not forwarded, plus the auth headers we replace rather than pass through.
 _HOP_BY_HOP = frozenset(
@@ -88,12 +88,6 @@ def _inject_auth(headers: dict[str, str], route: ProviderRoute) -> None:
         headers["x-goog-api-key"] = route.api_key
     else:
         headers["authorization"] = f"Bearer {route.api_key}"
-
-
-def _free_port(host: str) -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind((host, 0))
-        return sock.getsockname()[1]
 
 
 class KeyProxy:
@@ -166,7 +160,7 @@ class KeyProxy:
 
     async def start(self, timeout: float = 10.0) -> KeyProxy:
         """Bind a free localhost port and serve until stopped."""
-        self._port = _free_port(self._host)
+        self._port = free_port(self._host)
         config = uvicorn.Config(
             self._app, host=self._host, port=self._port, log_level="error", lifespan="off"
         )

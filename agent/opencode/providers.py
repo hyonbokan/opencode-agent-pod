@@ -165,16 +165,16 @@ def to_opencode_variant(
     """
     if effort is None:
         return None
-    if provider_of(opencode_model) not in CATALOG_PROVIDERS:
+    provider = provider_of(opencode_model)
+    if provider not in CATALOG_PROVIDERS:
         return None
-    if provider_of(opencode_model) == "anthropic":
+    if provider == "anthropic":
         if structured_output:
             return None
         # opencode has no low/medium variants for Anthropic models
         return {ReasoningEffort.HIGH: "high", ReasoningEffort.MAX: "max"}.get(effort)
     if effort is ReasoningEffort.MAX:
-        model_id = opencode_model.split("/", 1)[-1]
-        if provider_of(opencode_model) == "openai" and supports_xhigh_effort(model_id):
+        if provider == "openai" and supports_xhigh_effort(model_id_of(opencode_model)):
             return "xhigh"
         return "high"
     return effort.value
@@ -188,7 +188,7 @@ def to_opencode_model(model: str) -> str:
     way an OpenAI snapshot date is stripped so the id matches opencode's model list.
     """
     if "/" in model:
-        provider_seg, _, model_id = model.partition("/")
+        provider_seg, model_id = provider_of(model), model_id_of(model)
         return f"{provider_seg}/{_strip_openai_snapshot(provider_seg, model_id)}"
     family = get_provider_for_model(model)
     name = next((seg for seg, p in CATALOG_PROVIDERS.items() if p.family is family), None)
@@ -202,6 +202,11 @@ def to_opencode_model(model: str) -> str:
 def provider_of(opencode_model: str) -> str:
     """The provider segment of an opencode ``provider/model`` id."""
     return opencode_model.split("/", 1)[0]
+
+
+def model_id_of(opencode_model: str) -> str:
+    """The model segment of an opencode ``provider/model`` id."""
+    return opencode_model.split("/", 1)[-1]
 
 
 def _inline_defs(schema: dict[str, Any]) -> dict[str, Any]:

@@ -37,7 +37,7 @@ _SERVE_STARTUP_TIMEOUT = float(os.getenv("AGENT_SERVE_STARTUP_TIMEOUT", "60"))
 _REAP_ENV_MARKER = "OPENCODE_POD_REAP_TAG"
 
 
-def _free_port(host: str) -> int:
+def free_port(host: str) -> int:
     """Return a free TCP port on the host.
 
     Between releasing it here and opencode binding it, the port could be taken; that surfaces as an
@@ -132,7 +132,7 @@ class OpencodeServer:
         """
         last_error: Exception | None = None
         for attempt in range(attempts):
-            port = _free_port(self._host)
+            port = free_port(self._host)
             proc = await asyncio.create_subprocess_exec(
                 "opencode",
                 "serve",
@@ -151,9 +151,9 @@ class OpencodeServer:
             self._proc = proc
             self._port = port
             self._drain_task = asyncio.create_task(drain_output(proc.stdout, self._output))
+            self._client = httpx.AsyncClient(timeout=_CLIENT_TIMEOUT)
             try:
                 await self._await_healthy()
-                self._client = httpx.AsyncClient(timeout=_CLIENT_TIMEOUT)
                 # Open the shared event stream before declaring the daemon ready: a run's caps are
                 # enforced off it, so a daemon that can't stream events must fail startup (and be
                 # retried) rather than serve runs whose budget/turn caps silently can't fire.
@@ -181,21 +181,15 @@ class OpencodeServer:
         early if the daemon process has already exited."""
         assert self._proc is not None
         deadline = time.monotonic() + self._startup_timeout
-        url = self.base_url + _HEALTH_PATH
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            while time.monotonic() < deadline:
-                if self._proc.returncode is not None:
-                    raise RuntimeError(
-                        f"daemon exited during startup (rc={self._proc.returncode}): "
-                        f"{self._output_tail()}"
-                    )
-                try:
-                    resp = await client.get(url)
-                    if resp.status_code == 200:
-                        return
-                except httpx.HTTPError:
-                    pass  # not accepting connections yet
-                await asyncio.sleep(0.2)
+        while time.monotonic() < deadline:
+            if self._proc.returncode is not None:
+                raise RuntimeError(
+                    f"daemon exited during startup (rc={self._proc.returncode}): "
+                    f"{self._output_tail()}"
+                )
+            if await self.is_responsive():
+                return
+            await asyncio.sleep(0.2)
         raise TimeoutError(
             f"daemon not healthy within {self._startup_timeout:.0f}s: {self._output_tail()}"
         )

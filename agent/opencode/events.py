@@ -56,6 +56,15 @@ def session_id_of(event: dict[str, Any]) -> str | None:
     return part.get("sessionID") if isinstance(part, dict) else None
 
 
+async def abort_session(client: httpx.AsyncClient, base_url: str, session_id: str) -> None:
+    """Ask the daemon to stop a session; best-effort, so a failure is logged and never raised."""
+    try:
+        resp = await client.post(f"{base_url}/session/{session_id}/abort", json={})
+        resp.raise_for_status()
+    except Exception as e:
+        logger.warning("opencode abort of session %s failed: %s", session_id, e)
+
+
 class EventConsumer:
     """The daemon's single ``/event`` reader, dispatching decoded events to per-session watchers.
 
@@ -165,7 +174,7 @@ class EventConsumer:
         # Fire off the dispatch loop so a slow POST can't stall other sessions. A watcher asks for
         # an abort at most once (it latches), so there is at most one abort task per session.
         if action.abort:
-            self._spawn(self._abort(run_id))
+            self._spawn(abort_session(self._client, self._base_url, run_id))
         for target, body in action.prompts:
             self._spawn(self._prompt(target, body))
 
@@ -182,10 +191,6 @@ class EventConsumer:
         task = asyncio.create_task(coro)
         self._action_tasks.add(task)
         task.add_done_callback(self._action_tasks.discard)
-
-    async def _abort(self, session_id: str) -> None:
-        with contextlib.suppress(Exception):  # best-effort; must never crash the consumer
-            await self._client.post(f"{self._base_url}/session/{session_id}/abort", json={})
 
     async def _prompt(self, session_id: str, body: dict[str, Any]) -> None:
         try:

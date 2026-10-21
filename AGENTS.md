@@ -67,7 +67,7 @@ The project has its own `.venv`; run tooling through it. A fresh clone has no co
 
 ```bash
 cd opencode-agent-pod
-.venv/bin/python -m pytest tests/ -q          # expect: 243 passed, 0 reds
+.venv/bin/python -m pytest tests/ -q          # expect: all passed, 0 reds
 ```
 
 ## Decisions locked
