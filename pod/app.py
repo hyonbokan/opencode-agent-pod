@@ -1,6 +1,6 @@
 """The FastAPI app: a bearer-guarded ``POST /agent/run`` that streams one autonomous run as SSE.
 
-Internal, trusted-network service (DESIGN §11): a shared bearer token gates every run, each run is
+Internal, trusted-network service: a shared bearer token gates every run, each run is
 budget-capped and workspace-isolated, and daemons are drained at shutdown. Not a public endpoint.
 """
 

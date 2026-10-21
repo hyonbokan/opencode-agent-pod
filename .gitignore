@@ -23,10 +23,9 @@ env/
 ENV/
 *.venv
 
-# --- Secrets & environment (the .env.example template stays tracked) ---
+# --- Secrets & environment (the env.example template stays tracked) ---
 .env
 .env.*
-!.env.example
 *.pem
 *.key
 

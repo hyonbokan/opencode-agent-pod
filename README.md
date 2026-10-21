@@ -61,8 +61,7 @@ run ends.
 `https://` (and loopback `http://`) pulls over the network so the pod shares no
 filesystem with the caller. Local `file://` / bare paths still work when both share a
 host. Native `s3://` and large-data RO mounts are not built yet. An LLM with `Bash`
-should not share a disk or network with a trusted backend; see
-[DESIGN → Scope](DESIGN.md#scope-prototype-vs-ideal-deployment) and [DEPLOY.md](DEPLOY.md).
+should not share a disk or network with a trusted backend; see [DEPLOY.md](DEPLOY.md).
 
 ## Architecture
 
@@ -203,7 +202,7 @@ Requires the `opencode` binary on `PATH` (the Docker image pins one) and a provi
 
 ```bash
 # Local (Python 3.12), auto-loads .env
-cp .env.example .env          # set AGENT_POD_TOKEN + a provider key (e.g. ANTHROPIC_API_KEY)
+cp env.example .env           # set AGENT_POD_TOKEN + a provider key (e.g. ANTHROPIC_API_KEY)
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m pod       # serves on :8080
 
@@ -223,6 +222,69 @@ curl -N -X POST http://localhost:8080/agent/run \
   -H "Authorization: Bearer $AGENT_POD_TOKEN" -H 'Content-Type: application/json' \
   -d '{"model": "anthropic/claude-haiku-4-5-20251001", "prompt": "Say hello."}'
 ```
+
+## Integrate with your service
+
+Your service calls the pod over HTTP; nothing else is shared. Per unit of work:
+
+1. **Stage the workspace** (optional). Upload the files the agent should see as a `.tar.gz`
+   or `.zip` to object storage and pass a pre-signed `https://` URL as `workspace.source`.
+   The pod extracts it into a throwaway directory and deletes it after the run.
+2. **POST one run** with your prompt, the tools it may use, and a `response_schema` if you
+   want JSON back.
+3. **Read the SSE stream.** Relay `token`/`tool` events to your UI if you show progress; the
+   `done` event is the result.
+4. **Act on the result.** Check `is_error` and `subtype`: `error_provider` and
+   `error_transport` are worth retrying (another model, or the same one); `error_timeout`,
+   `error_max_budget_usd` and `max_turns` will hit the same limit again unless you raise it.
+5. **Carry state yourself.** For a follow-up, start a new run and put the earlier
+   `structured_output` (or a summary) in the prompt. The pod keeps nothing between runs.
+
+A minimal Python client (`pip install httpx`):
+
+```python
+import json
+
+import httpx
+
+
+def run_agent(base_url: str, token: str, body: dict) -> dict:
+    """Run one agent task on the pod, printing live text, and return the final result."""
+    headers = {"Authorization": f"Bearer {token}"}
+    with httpx.stream(
+        "POST", f"{base_url}/agent/run", json=body, headers=headers, timeout=None
+    ) as resp:
+        resp.raise_for_status()
+        event = None
+        for line in resp.iter_lines():
+            if line.startswith("event: "):
+                event = line.removeprefix("event: ")
+            elif line.startswith("data: "):
+                data = json.loads(line.removeprefix("data: "))
+                if event == "token":
+                    print(data["text"], end="", flush=True)
+                elif event == "retry":
+                    print(f"\n[pod retrying: {data['reason']}]")
+                elif event == "done":
+                    return data
+    raise RuntimeError("stream ended without a done event")
+
+
+result = run_agent(
+    "http://localhost:8080",
+    "<AGENT_POD_TOKEN>",
+    {
+        "model": "anthropic/claude-haiku-4-5-20251001",
+        "prompt": "List the Python files in the workspace and say what each one does.",
+        "tools": ["Read", "Glob", "Grep"],
+        "workspace": {"source": "https://storage.example.com/presigned/run-42.tgz"},
+        "max_budget_usd": 0.50,
+    },
+)
+print(result["subtype"], result["total_cost_usd"])
+```
+
+Lines starting with `:` are keep-alives and can be ignored.
 
 ## Configuration
 
@@ -276,10 +338,6 @@ The pod itself is domain-free. These are real callers, not dependencies:
   `POST /agent/run` each; the agent resolved all 8 (5 extraction artifacts, 3 real
   under-declarations).
 
-Typical integration: build prompt and schema, stage a workspace (`https://` or local
-`file://`), POST one run per unit of work, relay `token`/`tool` SSE to your UI, and pass
-structured output forward as prior findings.
-
 ## Development
 
 ```bash
@@ -306,6 +364,6 @@ opencode-agent-pod/
 │   └── schema.py       #   RunRequest + JSON-Schema response pass-through
 ├── tests/              # unit tests
 ├── Dockerfile          # deployable image (pinned opencode + the service)
-├── DESIGN.md           # architecture and scope
+├── env.example         # every setting, with defaults; copy to .env
 └── DEPLOY.md           # deployment + egress hardening
 ```
